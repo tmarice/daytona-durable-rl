@@ -46,13 +46,15 @@ devices in an already initialized Python process requires starting a new process
 GPU training has not yet been verified on Daytona. GPU installation requirements:
 [JAX documentation](https://docs.jax.dev/en/latest/installation.html).
 
-The Playground release and Brax source revision are pinned in `pyproject.toml`,
+The Playground and Brax releases are pinned in `pyproject.toml`,
 and `uv.lock` records the resolved dependencies. Use `uv sync --locked` to retain
 that resolution. The released `playground==0.2.0` exposes the
 JAX/MJX API used here; this project does not follow Playground's changing GitHub
-main branch. Brax is pinned to upstream revision
-`303d89dfac42919e5fde7c91f24c28a505373b24`, which replaces removed JAX device-placement
-APIs. The published Brax 0.14.2 release still calls those APIs.
+main branch. Brax is installed from the published `brax==0.14.2` wheel.
+The vendored PPO trainer is derived from upstream revision
+`303d89dfac42919e5fde7c91f24c28a505373b24` and includes its fix for removed JAX
+device-placement APIs. Training uses this adapter; the published release's
+upstream PPO trainer still calls those removed APIs.
 
 The default uses seed 11, 128 parallel simulated environments, 8,388,608 requested
 training steps, nine evaluations during training, and 2,000-step (20-second)
@@ -225,8 +227,9 @@ the network. This is a functional example, not a statistically conclusive benchm
 ### Observed local results
 
 Verified on 2026-11-06 using Python 3.14.8, Playground 0.2.0, JAX/JAXlib 0.12.0.1,
-MuJoCo/MJX 3.17.0, and the pinned Brax revision. Both policies use the same 32
-held-out starts, deterministic actions, and a 20-second horizon.
+MuJoCo/MJX 3.17.0, and Brax revision `303d89dfac42919e5fde7c91f24c28a505373b24`.
+Both policies use the same 32 held-out starts, deterministic actions, and a
+20-second horizon.
 
 | Metric | Initial policy | Trained policy |
 | --- | --- | --- |
@@ -374,5 +377,6 @@ confirmation rule between later steps in [the reduced V1 plan](codex_plan_2.md).
 Upstream references:
 
 - [MuJoCo Playground release](https://pypi.org/project/playground/0.2.0/)
-- [Pinned Brax compatibility fix](https://github.com/google/brax/commit/303d89dfac42919e5fde7c91f24c28a505373b24)
+- [Brax release](https://pypi.org/project/brax/0.14.2/)
+- [Brax compatibility fix included in the vendored trainer](https://github.com/google/brax/commit/303d89dfac42919e5fde7c91f24c28a505373b24)
 - [MuJoCo MJX](https://mujoco.readthedocs.io/en/stable/mjx.html)

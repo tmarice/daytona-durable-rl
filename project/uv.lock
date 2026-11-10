@@ -173,7 +173,7 @@ wheels = [
 [[package]]
 name = "brax"
 version = "0.14.2"
-source = { git = "https://github.com/google/brax.git?rev=303d89dfac42919e5fde7c91f24c28a505373b24#303d89dfac42919e5fde7c91f24c28a505373b24" }
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "absl-py" },
     { name = "etils" },
@@ -195,6 +195,10 @@ dependencies = [
     { name = "tensorboardx" },
     { name = "trimesh" },
     { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/0f/64/c9edc16f856641a4ae5e21372cb5c56344971f5665f0b2dfbd2dbc8e0dfc/brax-0.14.2.tar.gz", hash = "sha256:fd5240fb30ea0d7b0a9da162eb4a460c3ad415c049453936118e2e05089222c2", size = 211557, upload-time = "2026-03-15T22:31:59.648Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/2c/34/c12809ec36063ffab41880b37f2305f8d502345dbf6b5a6471133231c687/brax-0.14.2-py3-none-any.whl", hash = "sha256:d33b7b222ba5d85fd0fc4d4c59aa46feb978684107ad3f79de6bfef97ab06693", size = 356878, upload-time = "2026-03-15T22:31:58.55Z" },
 ]
 
 [[package]]
@@ -565,7 +569,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "brax", git = "https://github.com/google/brax.git?rev=303d89dfac42919e5fde7c91f24c28a505373b24" },
+    { name = "brax", specifier = "==0.14.2" },
     { name = "daytona", extras = ["v0-sdk"], specifier = "==2.0.0a8" },
     { name = "matplotlib", specifier = ">=3.10,<4" },
     { name = "playground", specifier = "==0.2.0" },

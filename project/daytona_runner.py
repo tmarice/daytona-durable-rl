@@ -3,6 +3,8 @@ import logging
 import shlex
 import tarfile
 import uuid
+from collections.abc import AsyncIterator, Iterable
+from dataclasses import dataclass
 from enum import StrEnum
 from fnmatch import fnmatchcase
 from hashlib import sha256
@@ -23,11 +25,10 @@ from daytona.v0.common.errors import DaytonaError, DaytonaNotFoundError, Daytona
 from daytona.v0.common.snapshot import Snapshot
 from daytona.v0.common.volume import Volume
 
-# TODO Is this good?
 logger = logging.getLogger(__name__)
 
 
-# TODO State machine
+# TODO Allow only valid state transitions
 class DaytonaJobStatus(StrEnum):
     PENDING = "PENDING"
     PREPARING = "PREPARING"
@@ -36,6 +37,14 @@ class DaytonaJobStatus(StrEnum):
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     CANCELED = "CANCELED"
+
+
+@dataclass
+class DaytonaJobResult:
+    job_id: str
+    status: DaytonaJobStatus
+    exit_code: int | None = None
+    logs: str | None = None
 
 
 class DaytonaJob:
@@ -50,13 +59,14 @@ class DaytonaJob:
     ):
         self.id = uuid.uuid4().hex
         self.status = DaytonaJobStatus.PENDING
-        self.sandbox = None
         self._code_dir = f"/run/{self.id}/code"
         self._data_dir = f"/data/jobs/{self.id}"
+        self._checkpoint_dir = f"{self._data_dir}/checkpoints"
+        self._sandbox = None
         self._command_id = None
+
         config = dict(config)
-        config.setdefault("checkpoint_path", f"{self._data_dir}/checkpoints")
-        self._checkpoint_dir = config["checkpoint_path"]
+        config["checkpoint_dir"] = self._checkpoint_dir
         self._command = self._build_command(entrypoint, config)
 
         self._daytona = daytona
@@ -66,51 +76,62 @@ class DaytonaJob:
 
     async def start(self):
         """Starts the Daytona sandbox and runs the specified job."""
-        if self.status == DaytonaJobStatus.PREEMPTED:
-            logger.warning("Job %s was preempted, restarting...", self.id)
+        if self.status in (DaytonaJobStatus.PREEMPTED, DaytonaJobStatus.PENDING):
             self.status = DaytonaJobStatus.PREPARING
-            if self.sandbox is not None and self.sandbox.recoverable:
-                await self.sandbox.recover()
-            else:
-                self.sandbox = await self._create_sandbox()
+            self._sandbox = await self._create_sandbox()
+            await self._upload_source_package(self._sandbox)
 
-        elif self.status == DaytonaJobStatus.PENDING:
-            self.status = DaytonaJobStatus.PREPARING
-            self.sandbox = await self._create_sandbox()
+        else:
+            raise RuntimeError(f"Cannot start job {self.id} in status {self.status}")
 
-        await self.sandbox.process.create_session(self.id)
-        response = await self.sandbox.process.execute_session_command(
+        await self._sandbox.process.create_session(self.id)
+        response = await self._sandbox.process.execute_session_command(
             self.id, SessionExecuteRequest(command=self._command, run_async=True)
         )
 
         self._command_id = response.cmd_id
         self.status = DaytonaJobStatus.RUNNING
 
-    async def wait(self):
+    async def wait(self) -> DaytonaJobResult:
         while True:
-            await self.sandbox.refresh_data()
+            await self._sandbox.refresh_data()
 
             # TODO Handle manual deletion as preemption to be able to simulate failure
-            if self.sandbox.spot_evicted_at:
+            if self._sandbox.spot_evicted_at:
                 self.status = DaytonaJobStatus.PREEMPTED
                 raise DaytonaSpotEvictedError(
                     f"Job {self.id} was preempted by spot instance eviction."
                 )
 
-            command = await self.sandbox.process.get_session_command(self.id, self._command_id)
+            command = await self._sandbox.process.get_session_command(self.id, self._command_id)
             if command.exit_code is not None:
                 if command.exit_code == 0:
                     self.status = DaytonaJobStatus.COMPLETED
                 else:
                     self.status = DaytonaJobStatus.FAILED
 
-                return
+                logs = await self._sandbox.process.get_session_command_logs(
+                    self.id, self._command_id
+                )
+                return DaytonaJobResult(
+                    job_id=self.id,
+                    status=self.status,
+                    exit_code=command.exit_code,
+                    logs=logs.output,
+                )
 
             await asyncio.sleep(5)  # TODO Make this configurable
 
-    async def cancel(self, wait: bool = True):
-        await self.sandbox.delete(wait=wait)
+    async def cancel(self):
+        await self.cleanup()
         self.status = DaytonaJobStatus.CANCELED
+
+    async def cleanup(self, wait: bool = False):
+        if self._sandbox is not None:
+            try:
+                await self._sandbox.delete(wait=wait)
+            except DaytonaNotFoundError:
+                pass
 
     async def _create_sandbox(self) -> AsyncSandbox:
         try:
@@ -124,23 +145,23 @@ class DaytonaJob:
                     ephemeral=True,
                 )
             )
+            return sandbox
         except DaytonaError:
             logger.exception("Failed to create sandbox for job %s", self.id)
             raise
-        else:
-            # TODO Consider using ephemeral sandbox for uploading source code to the volume, and then reuse source
-            archive_path = f"/tmp/{self.id}-source.tar.gz"
-            # TODO Handle upload failures
-            await sandbox.fs.upload_file(self._source_package, archive_path)
-            result = await sandbox.process.exec(
-                f"mkdir -p {self._code_dir} {self._data_dir} {shlex.quote(self._checkpoint_dir)} && "
-                f"tar --no-same-owner -xzf {archive_path} -C {self._code_dir}",
-                timeout=60,
-            )
-            if result.exit_code != 0:
-                raise RuntimeError(f"Failed to prepare job {self.id} sandbox: {result.result}")
 
-        return sandbox
+    async def _upload_source_package(self, sandbox: AsyncSandbox):
+        # TODO Consider using ephemeral sandbox for uploading source code to the volume, and then reuse source
+        archive_path = f"/tmp/{self.id}-source.tar.gz"
+        # TODO Handle upload failures
+        await sandbox.fs.upload_file(self._source_package, archive_path)
+        result = await sandbox.process.exec(
+            f"mkdir -p {self._code_dir} {self._data_dir} {shlex.quote(self._checkpoint_dir)} && "
+            f"tar --no-same-owner -xzf {archive_path} -C {self._code_dir}",
+            timeout=60,
+        )
+        if result.exit_code != 0:
+            raise RuntimeError(f"Failed to prepare job {self.id} sandbox: {result.result}")
 
     def _build_command(self, entrypoint: str, config: dict) -> str:
         module, function = entrypoint.split(":", 1)
@@ -180,7 +201,7 @@ class DaytonaRunner:
 
     async def create_job(
         self,
-        config: dict,  # {"checkpoint_path": "/path/to/folder/checkpoints"}
+        config: dict,
     ) -> DaytonaJob:
         snapshot = await self._get_or_create_snapshot()
         volume = await self._get_or_create_volume()
@@ -197,30 +218,40 @@ class DaytonaRunner:
 
         return job
 
-    async def run(self, jobs):
+    async def run(self, jobs: Iterable[DaytonaJob]) -> AsyncIterator[DaytonaJobResult]:
+        """Yield job results, then raise any job exceptions together after the batch finishes."""
         slots = asyncio.Semaphore(self._max_concurrent_jobs)
         tasks = [asyncio.create_task(self._run_job(job, slots)) for job in jobs]
+        errors = []
 
         try:
             for task in asyncio.as_completed(tasks):
-                yield await task
+                try:
+                    result = await task
+                except Exception as exc:  # noqa
+                    errors.append(exc)
+                else:
+                    yield result
         finally:
-            # TODO Do I want to cancel all tasks if one fails?
             for task in tasks:
                 task.cancel()
 
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _run_job(self, job: DaytonaJob, slots: asyncio.Semaphore) -> DaytonaJob:
+        if errors:
+            raise ExceptionGroup("Some jobs failed", errors)
+
+    async def _run_job(self, job: DaytonaJob, slots: asyncio.Semaphore) -> DaytonaJobResult:
         # TODO Handle timeouts
         while True:
             async with slots:
                 try:
                     await job.start()
-                    await job.wait()
-                    return job
+                    return await job.wait()
                 except DaytonaSpotEvictedError:
                     logger.warning("Job %s was preempted, re-running...", job.id)
+                finally:
+                    await job.cleanup(wait=True)
 
     async def _get_or_create_snapshot(self) -> Snapshot:
         uv_lock_path = self._workdir / "uv.lock"
@@ -233,18 +264,18 @@ class DaytonaRunner:
         except DaytonaNotFoundError:
             # TODO Determine python version dynamically from pyproject.toml
             # TODO Install from uv.lock and include required system packages.
-            image = Image.base("python:3.14-slim-bookworm").pip_install_from_pyproject(
-                str(pyproject_toml_path), optional_dependencies=[]
-            )
-            snapshot = await self._daytona.v0.snapshot.create(
-                CreateSnapshotParams(
-                    name=key,
-                    image=image,
-                    resources=Resources(**self._resources),
-                ),
-                timeout=1200,
-                on_logs=lambda chunk: print(chunk, end="", flush=True),
-            )
+            async with asyncio.timeout(1200):
+                snapshot = await self._daytona.v0.snapshot.create(
+                    CreateSnapshotParams(
+                        name=key,
+                        image=Image.base("python:3.14-slim-bookworm").pip_install_from_pyproject(
+                            str(pyproject_toml_path), optional_dependencies=[]
+                        ),
+                        resources=Resources(**self._resources),
+                    ),
+                    # TODO Use verbose flag to control logging
+                    on_logs=lambda chunk: print(chunk, end="", flush=True),
+                )
 
         return snapshot
 
@@ -304,14 +335,14 @@ class ExperimentSession:
         self,
         experiment_id: str,
         attempt_id: str,
-        checkpoint_path: str,
+        checkpoint_dir: str,
     ):
-        self._checkpoint_path = Path(checkpoint_path)
+        self._checkpoint_dir = Path(checkpoint_dir)
 
     def save_checkpoint(self, checkpoint_data: dict):
-        # TODO Save checkpoint data to new file in checkpoint_path with unique name, and replace latest_checkpoint with symlink to it
+        # TODO Save checkpoint data to new file in checkpoint_dir with unique name, and replace latest_checkpoint with symlink to it
         pass
 
     def restore_checkpoint(self) -> dict:
-        # TODO Read latest checkpoint file from checkpoint_path and return its contents as dict, or None if no checkpoint exists
+        # TODO Read latest checkpoint file from checkpoint_dir and return its contents as dict, or None if no checkpoint exists
         pass

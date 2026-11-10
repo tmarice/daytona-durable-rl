@@ -5,8 +5,8 @@ description = "Manual MuJoCo/MJX PPO training with local checkpoints and resume"
 requires-python = ">=3.14,<3.15"
 dependencies = [
     "playground==0.2.0",
-    # Upstream fix for JAX's removal of device_put_replicated/device_put_sharded.
-    "brax @ git+https://github.com/google/brax.git@303d89dfac42919e5fde7c91f24c28a505373b24",
+    # The vendored PPO trainer includes the JAX device-placement compatibility fix.
+    "brax==0.14.2",
     "matplotlib>=3.10,<4",
     "daytona[v0-sdk]==2.0.0a8",
     "wandb>=0.31,<0.32",
