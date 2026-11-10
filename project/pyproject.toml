@@ -1,0 +1,23 @@
+[project]
+name = "daytona-experiment-runner"
+version = "0.1.0"
+description = "Manual MuJoCo/MJX PPO training with local checkpoints and resume"
+requires-python = ">=3.14,<3.15"
+dependencies = [
+    "playground==0.2.0",
+    # Upstream fix for JAX's removal of device_put_replicated/device_put_sharded.
+    "brax @ git+https://github.com/google/brax.git@303d89dfac42919e5fde7c91f24c28a505373b24",
+    "matplotlib>=3.10,<4",
+    "daytona[v0-sdk]==2.0.0a8",
+    "wandb>=0.31,<0.32",
+    "python-dotenv>=1.1,<2",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+target-version = "py314"
+line-length = 100
+# Preserve upstream formatting so the checkpoint adaptation is easy to diff.
+extend-exclude = ["daytona_runner/_vendor"]
