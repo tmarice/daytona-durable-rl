@@ -92,6 +92,7 @@ class DaytonaJob:
 
             # TODO Handle manual deletion as preemption to be able to simulate failure
             if self.sandbox.spot_evicted_at:
+                self.status = DaytonaJobStatus.PREEMPTED
                 raise DaytonaSpotEvictedError(
                     f"Job {self.id} was preempted by spot instance eviction."
                 )
@@ -210,18 +211,16 @@ class DaytonaRunner:
 
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _run_job(self, job: DaytonaJob, slots: asyncio.Semaphore):
-        async with slots:
-            try:
-                await job.start()
-                await job.wait()
-            except DaytonaSpotEvictedError:
-                # TODO Unify logging - do not scatter across all classes
-                logger.warning("Job %s was preempted, re-running...", job.id)
-                await job.start()
-                return await self._run_job(job, slots)
-            except Exception:
-                logger.exception("Job %s failed", job.id)
+    async def _run_job(self, job: DaytonaJob, slots: asyncio.Semaphore) -> DaytonaJob:
+        # TODO Handle timeouts
+        while True:
+            async with slots:
+                try:
+                    await job.start()
+                    await job.wait()
+                    return job
+                except DaytonaSpotEvictedError:
+                    logger.warning("Job %s was preempted, re-running...", job.id)
 
     async def _get_or_create_snapshot(self) -> Snapshot:
         uv_lock_path = self._workdir / "uv.lock"
