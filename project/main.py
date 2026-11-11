@@ -1,4 +1,4 @@
-"""Example library usage; replace the work directory and training entrypoint as needed."""
+"""Sweep Cartpole swing-up PPO settings on two concurrent Daytona H100s."""
 
 import asyncio
 import os
@@ -12,23 +12,41 @@ from daytona_runner import DaytonaRunner
 async def main() -> None:
     load_dotenv(override=False)
     runner = DaytonaRunner(
-        work_dir=".",
-        entrypoint="physical_ai.main:train",
-        resources={"cpu": 4, "memory": 8, "disk": 10},
+        work_dir="phy_rl",
+        entrypoint="train:run",
+        resources={"cpu": 4, "memory": 8, "disk": 20, "gpu": 1, "gpu_type": "H100"},
         volume_name="experiment_volume",
+        max_concurrent_jobs=2,
         secrets={"WANDB_API_KEY": os.environ["WANDB_API_KEY"]},
     )
     try:
-        sweep = {
-            "learning_rate": [0.001, 0.01, 0.1],
-            "batch_size": [32, 64, 128],
-            "num_layers": [2, 3, 4],
-        }
+        # Task choices: rough duration of the full 12-trial sweep on one H100,
+        # running sequentially with the current presets and video disabled:
+        #   CartpoleBalance        ~25-65 min
+        #   CartpoleSwingup        ~25-65 min
+        #   CheetahRun             ~30-70 min
+        #   WalkerWalk             ~35-75 min
+        #   Go1JoystickFlatTerrain ~30-70 min
+        #   PandaPickCube          ~35-75 min
+        # Unmeasured planning estimates: published A100 PPO throughput as a proxy,
+        # plus an assumed 2-5 min/trial for startup, JIT, evaluation, and result I/O.
+        # Cartpole estimates are less reliable because our batching differs more.
+        # Excludes initial image building, capacity queues, and preemption retries.
+        # Reference: https://arxiv.org/html/2502.08844v1 (Tables IV, VII, IX; Section VI).
         training_grid = [
-            {"learning_rate": lr, "batch_size": bs, "num_layers": nl}
-            for lr in sweep["learning_rate"]
-            for bs in sweep["batch_size"]
-            for nl in sweep["num_layers"]
+            {
+                "task": "CartpoleSwingup",
+                "backend": "gpu",
+                "seed": seed,
+                "learning_rate": lr,
+                "entropy_cost": entropy_cost,
+                "wandb": True,
+                "wandb_project": os.getenv("WANDB_PROJECT"),
+                "wandb_entity": os.getenv("WANDB_ENTITY"),
+            }
+            for lr in (0.0003, 0.001)
+            for entropy_cost in (0.001, 0.01)
+            for seed in (11, 22, 33)
         ]
 
         jobs = [await runner.create_job(config=cfg) for cfg in training_grid]

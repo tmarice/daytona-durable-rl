@@ -20,6 +20,108 @@ from phy_rl.train import Config, parse_args, run
     os.environ.get("RUN_MUJOCO_SMOKE") == "1", "Set RUN_MUJOCO_SMOKE=1 to execute real training"
 )
 class RealTrainingTests(unittest.TestCase):
+    def test_sweep_workload_persists_outputs_and_reports_from_a_fresh_reader(self):
+        from phy_rl.sweep import REPORT_PREFIX
+
+        command = (
+            "import json, sys; from phy_rl.sweep import run; "
+            "run(json.loads(sys.argv[1]), experiment_id=sys.argv[2], "
+            "attempt_id=sys.argv[3], checkpoint_dir=sys.argv[4])"
+        )
+        with tempfile.TemporaryDirectory() as root:
+            jobs = Path(root) / "jobs"
+
+            def invoke(config: dict, experiment: str, attempt: str) -> dict:
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        command,
+                        json.dumps(config),
+                        experiment,
+                        attempt,
+                        str(jobs / experiment / "checkpoints"),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=180,
+                )
+                (report,) = [
+                    json.loads(line.removeprefix(REPORT_PREFIX))
+                    for line in result.stdout.splitlines()
+                    if line.startswith(REPORT_PREFIX)
+                ]
+                return report
+
+            report = invoke(
+                {
+                    "total_steps": 128,
+                    "num_envs": 4,
+                    "episode_length": 32,
+                    "unroll_length": 8,
+                    "batch_size": 4,
+                    "num_minibatches": 2,
+                    "updates_per_batch": 2,
+                    "num_evals": 2,
+                    "eval_episodes": 2,
+                },
+                "training",
+                "first",
+            )
+            self.assertEqual(report["resolved"]["backend"], "cpu")
+            self.assertGreater(report["summary"]["policy_parameter_change_l2"], 0)
+            self.assertEqual(report["checkpoint"]["env_steps"], 128)
+            self.assertTrue((jobs / "training/attempts/first/summary.json").is_file())
+            restored = invoke({"verify_experiments": ["training"]}, "reader", "second")
+            self.assertEqual(
+                restored["checkpoints"],
+                [
+                    {
+                        **report["checkpoint"],
+                        "reader_attempt_id": "second",
+                    }
+                ],
+            )
+
+    def test_shared_checkpoint_directory_automatically_restores_a_replacement_attempt(self):
+        with tempfile.TemporaryDirectory() as root:
+            output = Path(root) / "runs"
+            checkpoints = Path(root) / "volume" / "checkpoints"
+            config = {
+                "total_steps": 128,
+                "num_envs": 4,
+                "episode_length": 32,
+                "unroll_length": 8,
+                "batch_size": 4,
+                "num_minibatches": 2,
+                "updates_per_batch": 2,
+                "num_evals": 2,
+                "eval_episodes": 2,
+                "output": str(output),
+            }
+            first = run(
+                config, experiment_id="experiment", attempt_id="first", checkpoint_dir=checkpoints
+            )
+            saved = read_checkpoint(checkpoints)
+            with mock.patch("phy_rl.train.save_state", side_effect=AssertionError("Saved state")):
+                second = run(
+                    {**config, "checkpoints": False},
+                    experiment_id="experiment",
+                    attempt_id="second",
+                    checkpoint_dir=checkpoints,
+                )
+            summary = json.loads((second / "summary.json").read_text())
+            self.assertEqual(summary["starting_step"], 128)
+            self.assertEqual(summary["steps_this_attempt"], 0)
+            self.assertEqual(summary["experiment_id"], "experiment")
+            self.assertEqual(summary["attempt_id"], "second")
+            self.assertEqual(summary["resumed_from"], str(saved.path))
+            self.assertEqual(summary["latest_checkpoint"], str(saved.path))
+            self.assertEqual(summary["policy_parameter_change_l2"], 0)
+            self.assertFalse((first / "checkpoints").exists())
+            self.assertFalse((second / "checkpoints").exists())
+
     def test_training_without_checkpoints_never_serializes_state(self):
         with (
             tempfile.TemporaryDirectory() as root,
@@ -96,7 +198,9 @@ class RealTrainingTests(unittest.TestCase):
                     wandb_project="test-project",
                 )
             )
-            checkpoint = next((first / "checkpoints").glob("update-00000001-*/manifest.json"))
+            checkpoint = next(
+                (first / "checkpoints").glob("checkpoint-00000000000000000001-*.json")
+            )
             second = run(parse_args(["--resume", str(checkpoint), "--output", root]))
             self.assertEqual(len(calls), 2)
             self.assertEqual(calls[0][0]["id"], calls[1][0]["id"])
@@ -116,6 +220,23 @@ class RealTrainingTests(unittest.TestCase):
                 self.assertTrue(all(record["attempt_id"] == directory.name for record in records))
                 self.assertTrue(all(not call.kwargs for call in remote.log.call_args_list))
                 self.assertEqual(remote.summary["attempt_status"], "completed")
+                saved = {Path(call.args[0]).name for call in remote.save.call_args_list}
+                self.assertTrue(
+                    {
+                        "metrics.jsonl",
+                        "metrics.csv",
+                        "evaluation_before.json",
+                        "evaluation_after.json",
+                        "summary.json",
+                        "learning_curves.png",
+                        "policy_comparison.png",
+                        "policy_comparison.mp4",
+                    }
+                    <= saved
+                )
+                for call in remote.save.call_args_list:
+                    self.assertTrue(Path(call.args[0]).is_file())
+                    self.assertEqual(call.kwargs["base_path"], str(directory.resolve().parent))
                 remote.finish.assert_called_once_with(exit_code=0)
                 identity = read_checkpoint(directory / "checkpoints").manifest["metadata"]["wandb"]
                 self.assertEqual(identity["id"], remote.id)
@@ -169,7 +290,7 @@ class RealTrainingTests(unittest.TestCase):
             self.assertEqual(len(summary["evaluation_after"]["episode_returns"]), 2)
             self.assertEqual(summary["evaluation_after"]["balance"]["episode_count"], 2)
             self.assertGreater((directory / "learning_curves.png").stat().st_size, 1000)
-            checkpoints = sorted((directory / "checkpoints").glob("update-*/manifest.json"))
+            checkpoints = sorted((directory / "checkpoints").glob("checkpoint-*.json"))
             self.assertEqual(
                 [read_checkpoint(path).manifest["completed_updates"] for path in checkpoints],
                 list(range(1, 17)),
@@ -284,7 +405,7 @@ with patch.object(Checkpoint, 'restore', audited_restore):
             rows = [json.loads(row) for row in (second / "metrics.jsonl").read_text().splitlines()]
             self.assertEqual(rows[0]["step"], 192)
             self.assertEqual([row["step"] for row in rows], sorted(row["step"] for row in rows))
-            checkpoints = sorted((second / "checkpoints").glob("update-*/manifest.json"))
+            checkpoints = sorted((second / "checkpoints").glob("checkpoint-*.json"))
             self.assertEqual(
                 [read_checkpoint(path).manifest["completed_updates"] for path in checkpoints],
                 [5, 8],

@@ -20,7 +20,9 @@ from daytona.v0 import (
     CreateSnapshotParams,
     Image,
     Resources,
+    SandboxState,
     SessionExecuteRequest,
+    UpdateSecretParams,
     VolumeMount,
 )
 from daytona.v0.common.errors import DaytonaError, DaytonaNotFoundError, DaytonaSpotEvictedError
@@ -47,6 +49,7 @@ class DaytonaJobResult:
     status: DaytonaJobStatus
     exit_code: int | None = None
     logs: str | None = None
+    # TODO Add output artifacts
 
 
 class DaytonaJob:
@@ -60,13 +63,12 @@ class DaytonaJob:
         config: dict,
         secrets: dict[str, str] | None = None,
     ):
+        # TODO Stable job IDs would allow resuming a job after runner restart
         self.id = uuid.uuid4().hex
         self.status = DaytonaJobStatus.PENDING
         self._code_dir = f"/run/{self.id}/code"
         self._data_dir = f"/data/jobs/{self.id}"
         self._checkpoint_dir = f"{self._data_dir}/checkpoints"
-        self._sandbox = None
-        self._command_id = None
         self.attempt_id: str | None = None
         self._entrypoint = entrypoint
         self._config = dict(config)
@@ -77,82 +79,107 @@ class DaytonaJob:
         self._volume = volume
         self._secrets = secrets or {}
 
-    async def start(self):
-        """Starts the Daytona sandbox and runs the specified job."""
-        if self.status in (DaytonaJobStatus.PREEMPTED, DaytonaJobStatus.PENDING):
-            self.attempt_id = uuid.uuid4().hex
-            self.status = DaytonaJobStatus.PREPARING
-            self._sandbox = await self._create_sandbox()
-            await self._upload_source_package(self._sandbox)
+    async def run_attempt(self) -> DaytonaJobResult:
+        """Runs the job in a new sandbox, which is deleted before this returns or raises."""
+        self.attempt_id = uuid.uuid4().hex
+        self.status = DaytonaJobStatus.PREPARING
+        sandbox_name = f"job-{self.id}-{self.attempt_id[:8]}"
+        sandbox = None
+        try:
+            sandbox = await self._create_sandbox(sandbox_name)
+            await self._upload_source_package(sandbox)
+            await sandbox.process.create_session(self.id)
+            response = await sandbox.process.execute_session_command(
+                self.id, SessionExecuteRequest(command=self._build_command(), run_async=True)
+            )
+            self.status = DaytonaJobStatus.RUNNING
+            result = await self._wait_for_command(sandbox, response.cmd_id)
+            self.status = result.status
+            return result
+        except DaytonaSpotEvictedError:
+            self.status = DaytonaJobStatus.PREEMPTED
+            raise
+        except asyncio.CancelledError:
+            self.status = DaytonaJobStatus.CANCELED
+            raise
+        except Exception:
+            self.status = DaytonaJobStatus.FAILED
+            raise
+        finally:
+            await self._delete_sandbox(sandbox, sandbox_name)
 
-        else:
-            raise RuntimeError(f"Cannot start job {self.id} in status {self.status}")
-
-        await self._sandbox.process.create_session(self.id)
-        response = await self._sandbox.process.execute_session_command(
-            self.id, SessionExecuteRequest(command=self._build_command(), run_async=True)
-        )
-
-        self._command_id = response.cmd_id
-        self.status = DaytonaJobStatus.RUNNING
-
-    async def wait(self) -> DaytonaJobResult:
+    async def _wait_for_command(self, sandbox: AsyncSandbox, command_id: str) -> DaytonaJobResult:
         while True:
-            await self._sandbox.refresh_data()
+            await self._raise_if_preempted(sandbox)
 
-            # TODO Handle manual deletion as preemption to be able to simulate failure
-            if self._sandbox.spot_evicted_at:
-                self.status = DaytonaJobStatus.PREEMPTED
-                raise DaytonaSpotEvictedError(
-                    f"Job {self.id} was preempted by spot instance eviction."
-                )
+            try:
+                command = await sandbox.process.get_session_command(self.id, command_id)
+                if command.exit_code is not None:
+                    logs = await sandbox.process.get_session_command_logs(self.id, command_id)
+            except DaytonaError:
+                await self._raise_if_preempted(sandbox)
+                raise
 
-            command = await self._sandbox.process.get_session_command(self.id, self._command_id)
             if command.exit_code is not None:
-                if command.exit_code == 0:
-                    self.status = DaytonaJobStatus.COMPLETED
-                else:
-                    self.status = DaytonaJobStatus.FAILED
-
-                logs = await self._sandbox.process.get_session_command_logs(
-                    self.id, self._command_id
-                )
                 return DaytonaJobResult(
                     job_id=self.id,
-                    status=self.status,
+                    status=(
+                        DaytonaJobStatus.COMPLETED
+                        if command.exit_code == 0
+                        else DaytonaJobStatus.FAILED
+                    ),
                     exit_code=command.exit_code,
                     logs=logs.output,
                 )
 
             await asyncio.sleep(5)  # TODO Make this configurable
 
-    async def cancel(self):
-        await self.cleanup()
-        self.status = DaytonaJobStatus.CANCELED
+    async def _raise_if_preempted(self, sandbox: AsyncSandbox) -> None:
+        try:
+            await sandbox.refresh_data()
+        except DaytonaNotFoundError:
+            reason = "sandbox no longer exists"
+        else:
+            if sandbox.spot_evicted_at:
+                reason = "spot instance eviction"
+            elif sandbox.state in (
+                SandboxState.STOPPING,
+                SandboxState.STOPPED,
+                SandboxState.DESTROYING,
+                SandboxState.DESTROYED,
+            ):
+                reason = f"sandbox is {sandbox.state}"
+            else:
+                return
 
-    async def cleanup(self, wait: bool = False) -> None:
-        if self._sandbox is not None:
-            try:
-                await self._sandbox.delete(wait=wait)
-            except DaytonaNotFoundError:
-                pass
-            except Exception:
-                logger.exception("Failed to delete sandbox for job %s", self.id)
-                raise
-            self._sandbox = None
-            self._command_id = None
+        raise DaytonaSpotEvictedError(f"Job {self.id} was preempted: {reason}.")
 
-    async def _create_sandbox(self) -> AsyncSandbox:
+    async def _delete_sandbox(self, sandbox: AsyncSandbox | None, name: str) -> None:
+        """Best effort, so that a failed deletion cannot replace the attempt's outcome."""
+        try:
+            if sandbox is None:
+                sandbox = await self._daytona.v0.get(name)
+            await sandbox.delete(wait=False)
+        except DaytonaNotFoundError:
+            pass
+        except Exception:
+            logger.exception(
+                "Failed to delete sandbox %s for job %s; its TTL will remove it", name, self.id
+            )
+
+    async def _create_sandbox(self, name: str) -> AsyncSandbox:
         try:
             # TODO Handle not enough capacity failures -- retry after x seconds
             sandbox = await self._daytona.v0.create(
                 CreateSandboxFromSnapshotParams(
+                    name=name,
                     snapshot=self._snapshot.name,
                     volumes=[VolumeMount(volume_id=self._volume.id, mount_path="/data")],
                     secrets=self._secrets,
                     auto_stop_interval=0,
                     ttl_minutes=65,
                     ephemeral=True,
+                    spot=True,
                 )
             )
             return sandbox
@@ -223,7 +250,7 @@ class DaytonaRunner:
         snapshot = await self._get_or_create_snapshot()
         volume = await self._get_or_create_volume()
         if self._secret_names is None:
-            self._secret_names = await self._get_or_create_secrets(self._secrets)
+            self._secret_names = await self._create_or_update_secrets(self._secrets)
 
         job = DaytonaJob(
             daytona=self._daytona,
@@ -266,12 +293,9 @@ class DaytonaRunner:
         while True:
             async with slots:
                 try:
-                    await job.start()
-                    return await job.wait()
+                    return await job.run_attempt()
                 except DaytonaSpotEvictedError:
                     logger.warning("Job %s was preempted, re-running...", job.id)
-                finally:
-                    await job.cleanup(wait=False)
 
     async def _get_or_create_snapshot(self) -> Snapshot:
         uv_lock_path = self._workdir / "uv.lock"
@@ -307,6 +331,7 @@ class DaytonaRunner:
                     on_logs=lambda chunk: print(chunk, end="", flush=True),
                 )
 
+        # TODO Check snapshot state
         return snapshot
 
     async def _get_or_create_volume(self) -> Volume:
@@ -322,8 +347,8 @@ class DaytonaRunner:
 
         return volume
 
-    async def _get_or_create_secrets(self, secrets: dict) -> dict:
-        existing_names = set()
+    async def _create_or_update_secrets(self, secrets: dict) -> dict:
+        existing_ids = {}
         secret_names = {}
         if not secrets:
             return secret_names
@@ -331,14 +356,19 @@ class DaytonaRunner:
         cursor = None
         while True:
             page = await self._daytona.v0.secret.list(cursor=cursor)
-            existing_names |= {s.name for s in page.items}
+            existing_ids |= {s.name: s.id for s in page.items}
             cursor = page.next_cursor
             if cursor is None:
                 break
 
         for env_name, value in secrets.items():
             name = f"daytona-runner-{env_name}"
-            if name not in existing_names:
+            if name in existing_ids:
+                # Stored values cannot be read back to compare, so always overwrite.
+                await self._daytona.v0.secret.update(
+                    existing_ids[name], UpdateSecretParams(value=value)
+                )
+            else:
                 await self._daytona.v0.secret.create(CreateSecretParams(name=name, value=value))
 
             secret_names[env_name] = name

@@ -18,10 +18,29 @@ import traceback
 from dataclasses import dataclass
 from pathlib import Path
 
-from phy_rl.checkpointing import read_checkpoint, save_state
-from phy_rl.evaluation import evaluate_policy
-from phy_rl.results import Metrics, create_run_directory, write_json
-from phy_rl.tracking import WandbTracker
+if __package__:
+    from .checkpointing import checkpoint_from_data, read_checkpoint, save_state
+    from .daytona_experiment_session import (
+        ExperimentSession,
+        latest_checkpoint_path,
+        read_checkpoint_document,
+    )
+    from .evaluation import evaluate_policy
+    from .results import Metrics, create_run_directory, write_json
+    from .tasks import TASK_DEFAULTS, network_settings, prepare_robot_assets
+    from .tracking import WandbTracker
+else:
+    # Daytona uploads the contents of phy_rl and imports this module as `train`.
+    from checkpointing import checkpoint_from_data, read_checkpoint, save_state
+    from daytona_experiment_session import (
+        ExperimentSession,
+        latest_checkpoint_path,
+        read_checkpoint_document,
+    )
+    from evaluation import evaluate_policy
+    from results import Metrics, create_run_directory, write_json
+    from tasks import TASK_DEFAULTS, network_settings, prepare_robot_assets
+    from tracking import WandbTracker
 
 
 @dataclass(frozen=True)
@@ -57,8 +76,8 @@ class Config:
             raise ValueError("wandb_mode must be online or offline")
         if self.backend not in {"cpu", "gpu"}:
             raise ValueError("backend must be cpu or gpu")
-        if self.task not in {"CartpoleBalance", "CartpoleSwingup"}:
-            raise ValueError("Supported tasks are CartpoleBalance and CartpoleSwingup")
+        if self.task not in TASK_DEFAULTS:
+            raise ValueError(f"Supported tasks are {', '.join(TASK_DEFAULTS)}")
         if not 0 <= self.seed < 2**32:
             raise ValueError("seed must be in [0, 2**32)")
         if type(self.checkpoint_interval_steps) is not int:
@@ -118,6 +137,29 @@ def training_config(config: Config) -> dict:
     }
 
 
+def config_from_values(supplied: dict) -> Config:
+    """Inherit resume settings while rejecting explicit training changes."""
+    supplied = dict(supplied)
+    supplied.setdefault("backend", Config().backend)
+    values = {}
+    if supplied.get("resume") is not None:
+        checkpoint = read_checkpoint(Path(supplied["resume"]))
+        values = checkpoint.manifest["metadata"]["requested"].copy()
+        for key, value in supplied.items():
+            if key not in RUNTIME_OPTIONS and values.get(key) != value:
+                raise ValueError(f"--{key.replace('_', '-')} conflicts with the checkpoint")
+    else:
+        values.update(TASK_DEFAULTS.get(supplied.get("task", Config().task), {}))
+    values.update(supplied)
+    if "output" in values:
+        values["output"] = Path(values["output"])
+    if values.get("resume") is not None:
+        values["resume"] = Path(values["resume"])
+    config = Config(**values)
+    config.validate()
+    return config
+
+
 def parse_args(argv: list[str] | None = None) -> Config:
     defaults = Config()
     parser = argparse.ArgumentParser(description=__doc__)
@@ -136,9 +178,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         const="gpu",
         help="Train on an NVIDIA GPU; requires CUDA-enabled JAX",
     )
-    parser.add_argument(
-        "--task", choices=["CartpoleBalance", "CartpoleSwingup"], default=defaults.task
-    )
+    parser.add_argument("--task", choices=list(TASK_DEFAULTS), default=defaults.task)
     parser.add_argument("--seed", type=int, default=defaults.seed)
     parser.add_argument("--total-steps", type=int, default=defaults.total_steps)
     parser.add_argument("--num-envs", type=int, default=defaults.num_envs)
@@ -154,7 +194,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
     parser.add_argument("--num-evals", type=int, default=defaults.num_evals)
     parser.add_argument("--eval-episodes", type=int, default=defaults.eval_episodes)
     parser.add_argument(
-        "--video", action="store_true", help="Save a 2D before/after policy video (requires ffmpeg)"
+        "--video", action="store_true", help="Save a before/after policy video (requires ffmpeg)"
     )
     parser.add_argument("--output", type=Path, default=defaults.output)
     parser.add_argument(
@@ -185,7 +225,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
     parser.add_argument(
         "--resume",
         type=Path,
-        help="Resume from a checkpoint manifest, checkpoint directory, or latest.json",
+        help="Resume from a session checkpoint JSON file or checkpoint directory",
     )
     # Preserve which options the caller supplied: omitted settings come from the
     # checkpoint, while conflicting training overrides are explicit errors.
@@ -193,20 +233,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
         if action.dest != "help":
             action.default = argparse.SUPPRESS
     supplied = vars(parser.parse_args(argv))
-    # Device selection is local to this invocation, including when resuming.
-    supplied.setdefault("backend", defaults.backend)
     try:
-        values = {}
-        if supplied.get("resume") is not None:
-            checkpoint = read_checkpoint(supplied["resume"])
-            values = checkpoint.manifest["metadata"]["requested"].copy()
-            for key, value in supplied.items():
-                if key not in RUNTIME_OPTIONS and values.get(key) != value:
-                    raise ValueError(f"--{key.replace('_', '-')} conflicts with the checkpoint")
-            values["output"] = Path(values["output"])
-        values.update(supplied)
-        config = Config(**values)
-        config.validate()
+        config = config_from_values(supplied)
     except (ValueError, KeyError, TypeError) as error:
         parser.error(str(error))
     return config
@@ -271,23 +299,36 @@ def initialize_jax(backend: str):
 
 
 def train(
-    config: Config, directory: Path, metrics: Metrics, tracker: WandbTracker | None = None
+    config: Config,
+    directory: Path,
+    metrics: Metrics,
+    session: ExperimentSession,
+    tracker: WandbTracker | None = None,
 ) -> dict:
+    data = session.restore_checkpoint(config.resume)
+    checkpoint = None
+    if data is not None:
+        assert session.latest_checkpoint is not None
+        checkpoint = checkpoint_from_data(session.latest_checkpoint, data)
     jax = initialize_jax(config.backend)
     os.environ.setdefault("MPLCONFIGDIR", str(directory / ".matplotlib"))
     from brax.training.agents.ppo import networks as ppo_networks
     from mujoco_playground import registry, wrapper
 
-    from phy_rl._vendor import brax_ppo as ppo
+    if __package__:
+        from ._vendor import brax_ppo as ppo
+    else:
+        from _vendor import brax_ppo as ppo
 
     env_config = registry.get_default_config(config.task)
     env_config.impl = "jax"
     env_config.episode_length = config.episode_length
     env_config.vision = False
+    prepare_robot_assets(config.task, directory)
     env = registry.load(config.task, config=env_config)
     eval_env = registry.load(config.task, config=env_config)
     settings = ppo_settings(config)
-    architecture = {"policy_hidden_layer_sizes": [64, 64], "value_hidden_layer_sizes": [64, 64]}
+    architecture = network_settings(config.task)
     versions = {
         package: importlib.metadata.version(package)
         for package in (
@@ -313,7 +354,6 @@ def train(
         "versions": versions,
         "trainer_sha256": hashlib.sha256(Path(ppo.__file__).read_bytes()).hexdigest(),
     }
-    checkpoint = read_checkpoint(config.resume) if config.resume is not None else None
     if checkpoint is not None and checkpoint.manifest["metadata"]["compatibility"] != compatibility:
         raise ValueError(
             "Checkpoint training configuration, versions, or trainer source is incompatible"
@@ -324,23 +364,18 @@ def train(
         checkpoint.manifest["completed_updates"] * steps_per_update != starting_step
     ):
         raise ValueError("Checkpoint update count and environment-step count disagree")
-    experiment_id = (
-        checkpoint.manifest["metadata"]["experiment_id"]
-        if checkpoint is not None
-        else directory.name
-    )
     metadata = {
         "requested": config_values(config),
         "compatibility": compatibility,
-        "experiment_id": experiment_id,
-        "attempt_id": directory.name,
+        "experiment_id": session.experiment_id,
+        "attempt_id": session.attempt_id,
         "resumed_from": str(checkpoint.path) if checkpoint is not None else None,
     }
     previous_tracking = checkpoint.manifest["metadata"].get("wandb") if checkpoint else None
     if tracker is not None:
         tracker.start(
             config,
-            experiment_id,
+            session.experiment_id,
             {**training_config(config), "network": architecture, "versions": versions},
             previous_tracking,
         )
@@ -367,6 +402,7 @@ def train(
             "platform": platform.platform(),
             "backend": jax.default_backend(),
             "devices": [str(device) for device in jax.devices()],
+            "device_kinds": [device.device_kind for device in jax.devices()],
             "checkpoints_enabled": config.checkpoints,
             "checkpoint_interval_unit": "completed_ppo_updates",
             "environment_steps_per_update": steps_per_update,
@@ -416,7 +452,7 @@ def train(
         nonlocal latest_checkpoint
         started = time.monotonic()
         path = save_state(
-            directory / "checkpoints",
+            session,
             state,
             completed_updates=completed_updates,
             metadata=metadata,
@@ -480,13 +516,16 @@ def train(
         "starting_step": starting_step,
         "steps_this_attempt": actual_steps - starting_step,
         "completed_updates": actual_steps // steps_per_update,
-        "experiment_id": experiment_id,
-        "attempt_id": directory.name,
+        "experiment_id": session.experiment_id,
+        "attempt_id": session.attempt_id,
         "resumed_from": str(checkpoint.path) if checkpoint is not None else None,
         "latest_checkpoint": latest_checkpoint,
     }
     if config.video:
-        from phy_rl.video import write_comparison
+        if __package__:
+            from .video import write_comparison
+        else:
+            from video import write_comparison
 
         summary["video"] = write_comparison(
             eval_env, initial_rollouts, final_rollouts, config, directory
@@ -494,9 +533,37 @@ def train(
     return summary
 
 
-def run(config: Config) -> Path:
+def run(
+    config: Config | dict,
+    *,
+    experiment_id: str | None = None,
+    attempt_id: str | None = None,
+    checkpoint_dir: str | Path | None = None,
+) -> Path:
+    if isinstance(config, dict):
+        config = config_from_values(config)
     config.validate()
-    directory = create_run_directory(config.output, config.task, config.seed)
+    resume = config.resume
+    if resume is None and checkpoint_dir is not None:
+        resume = latest_checkpoint_path(Path(checkpoint_dir))
+    if resume is not None:
+        config = dataclasses.replace(config, resume=Path(resume))
+        if experiment_id is None:
+            _, document = read_checkpoint_document(config.resume)
+            experiment_id = document["experiment_id"]
+    if attempt_id is None:
+        directory = create_run_directory(config.output, config.task, config.seed)
+        attempt_id = directory.name
+    else:
+        if not attempt_id or Path(attempt_id).name != attempt_id or attempt_id in {".", ".."}:
+            raise ValueError("attempt_id must be a single directory name")
+        directory = config.output / attempt_id
+        directory.mkdir(parents=True, exist_ok=False)
+    session = ExperimentSession(
+        experiment_id if experiment_id is not None else attempt_id,
+        attempt_id,
+        checkpoint_dir if checkpoint_dir is not None else directory / "checkpoints",
+    )
     metrics = Metrics(directory)
     write_json(
         directory / "requested_config.json",
@@ -505,7 +572,7 @@ def run(config: Config) -> Path:
     print(f"Results: {directory.resolve()}", flush=True)
     write_json(directory / "status.json", {"status": "running"})
     started = time.monotonic()
-    tracker = WandbTracker(directory) if config.wandb else None
+    tracker = WandbTracker(directory, attempt_id=session.attempt_id) if config.wandb else None
     summary = None
     status = "failed"
     try:
@@ -513,7 +580,7 @@ def run(config: Config) -> Path:
             raise RuntimeError(
                 "--video requires ffmpeg on PATH; install it before running training"
             )
-        summary = train(config, directory, metrics, tracker)
+        summary = train(config, directory, metrics, session, tracker)
         metrics.export_csv()
         metrics.plot()
         summary["wall_seconds"] = time.monotonic() - started
@@ -566,7 +633,7 @@ def main(argv: list[str] | None = None) -> int:
         print(
             (
                 "Training interrupted; metrics and any committed checkpoints were retained. "
-                "Use --resume with the latest.json in an attempt's checkpoints directory."
+                "Use --resume with the session's checkpoint directory or a checkpoint JSON file."
                 if config.checkpoints
                 else "Training interrupted; metrics were retained. Checkpointing was disabled."
             ),

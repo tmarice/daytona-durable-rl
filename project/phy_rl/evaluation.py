@@ -33,9 +33,20 @@ def capture_rollouts(env, make_policy, params, config) -> dict:
                 (state, key),
             )
             reward = jnp.where(active, state.reward, 0)
-            return (state, key), (state.data.qpos, reward, action, active)
+            task_metrics = {
+                name: jnp.where(active, value, 0) for name, value in state.metrics.items()
+            }
+            return (state, key), (
+                state.data.qpos,
+                reward,
+                action,
+                active,
+                state.data.mocap_pos,
+                state.data.mocap_quat,
+                task_metrics,
+            )
 
-        _, (qpos, rewards, actions, active) = jax.lax.scan(
+        _, (qpos, rewards, actions, active, mocap_pos, mocap_quat, task_metrics) = jax.lax.scan(
             advance, (initial, policy_key), None, length=config.episode_length
         )
         return {
@@ -43,6 +54,9 @@ def capture_rollouts(env, make_policy, params, config) -> dict:
             "returns": jnp.concatenate((jnp.zeros(1), jnp.cumsum(rewards))),
             "actions": jnp.concatenate((jnp.zeros((1, env.action_size)), actions)),
             "length": active.sum(),
+            "mocap_pos": jnp.concatenate((initial.data.mocap_pos[None], mocap_pos)),
+            "mocap_quat": jnp.concatenate((initial.data.mocap_quat[None], mocap_quat)),
+            **{f"metric/{name}": values for name, values in task_metrics.items()},
         }
 
     key = jax.random.fold_in(jax.random.PRNGKey(config.seed), 1_000_003)
@@ -71,6 +85,19 @@ def evaluate_policy(env, make_policy, params, config) -> tuple[dict, dict]:
         "horizon": config.episode_length,
         "horizon_seconds": config.episode_length * env.dt,
     }
+    result["task_metrics"] = {
+        name.removeprefix("metric/"): float((values.sum(axis=1) / np.maximum(lengths, 1)).mean())
+        for name, values in rollouts.items()
+        if name.startswith("metric/")
+    }
+    if config.task in {"CheetahRun", "WalkerWalk"}:
+        position_index = env.mj_model.joint("rootx").qposadr[0]
+        displacement = (
+            rollouts["qpos"][:, -1, position_index] - rollouts["qpos"][:, 0, position_index]
+        )
+        result["task_metrics"]["forward_speed_m_per_s"] = float(
+            (displacement / (np.maximum(lengths, 1) * env.dt)).mean()
+        )
     if config.task == "CartpoleBalance":
         qpos = rollouts["qpos"]
         angles = np.abs(np.arctan2(np.sin(qpos[:, :, 1]), np.cos(qpos[:, :, 1])))

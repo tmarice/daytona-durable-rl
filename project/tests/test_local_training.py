@@ -14,6 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from phy_rl.daytona_experiment_session import ExperimentSession
 from phy_rl.results import Metrics, create_run_directory
 from phy_rl.train import Config, initialize_jax, parse_args, ppo_settings, run
 
@@ -149,6 +150,54 @@ class ArtifactTests(unittest.TestCase):
 
 
 class RunLifecycleTests(unittest.TestCase):
+    def test_shared_session_auto_resume_explicit_override_and_local_identity(self):
+        with tempfile.TemporaryDirectory() as root:
+            output = Path(root) / "runs"
+            shared = Path(root) / "volume"
+            original = ExperimentSession("experiment", "first", shared)
+            first = original.save_checkpoint({"step": 64})
+            original.save_checkpoint({"step": 128})
+            observed = []
+
+            def fake_training(config, directory, metrics, session, tracker=None):
+                data = session.restore_checkpoint(config.resume)
+                observed.append((session, data, config))
+                return {
+                    "evaluation_before": {"mean_return": 1},
+                    "evaluation_after": {"mean_return": 3},
+                }
+
+            with (
+                mock.patch("phy_rl.train.train", side_effect=fake_training),
+                mock.patch.object(Metrics, "plot"),
+            ):
+                directory = run(
+                    {"output": str(output), "checkpoints": False},
+                    experiment_id="experiment",
+                    attempt_id="second",
+                    checkpoint_dir=shared,
+                )
+                self.assertEqual(directory, output / "second")
+                session, data, config = observed[-1]
+                self.assertEqual(session.experiment_id, "experiment")
+                self.assertEqual(session.attempt_id, "second")
+                self.assertEqual(session.checkpoint_dir, shared)
+                self.assertEqual(data, {"step": 128})
+                self.assertFalse(config.checkpoints)
+                self.assertIsNotNone(config.resume)
+
+                local = run(Config(output=output, resume=first))
+                session, data, _ = observed[-1]
+                self.assertEqual(session.experiment_id, "experiment")
+                self.assertEqual(session.attempt_id, local.name)
+                self.assertEqual(session.checkpoint_dir, local / "checkpoints")
+                self.assertEqual(data, {"step": 64})
+
+                run(Config(output=output, resume=first), checkpoint_dir=shared)
+                self.assertEqual(observed[-1][1], {"step": 64})
+                with self.assertRaisesRegex(ValueError, "different experiment"):
+                    run(Config(output=output), experiment_id="other", checkpoint_dir=shared)
+
     def test_failed_and_interrupted_runs_retain_metrics_and_diagnostics(self):
         for error, expected_status in [
             (RuntimeError("test worker failed"), "failed"),
@@ -156,7 +205,7 @@ class RunLifecycleTests(unittest.TestCase):
         ]:
             with self.subTest(status=expected_status), tempfile.TemporaryDirectory() as root:
 
-                def fake_training(config, directory, metrics, tracker=None, error=error):
+                def fake_training(config, directory, metrics, session, tracker=None, error=error):
                     metrics.record(64, {"training/loss": 0.4})
                     raise error
 
@@ -176,7 +225,7 @@ class RunLifecycleTests(unittest.TestCase):
     def test_success_records_results_from_training(self):
         with tempfile.TemporaryDirectory() as root:
 
-            def fake_training(config, directory, metrics, tracker=None):
+            def fake_training(config, directory, metrics, session, tracker=None):
                 metrics.record(128, {"eval/episode_reward": 3})
                 return {
                     "evaluation_before": {"mean_return": 1},

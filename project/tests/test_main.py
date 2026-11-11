@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, patch
 
 import main as example
 from daytona_runner import DaytonaJobResult, DaytonaJobStatus, DaytonaRunner
+from phy_rl.train import config_from_values
 
 
 class ExampleTests(unittest.IsolatedAsyncioTestCase):
@@ -37,11 +38,35 @@ class ExampleTests(unittest.IsolatedAsyncioTestCase):
             close=AsyncMock(side_effect=lambda: events.append("client closed")),
         )
         with (
-            patch.object(example, "DaytonaRunner", return_value=runner),
+            patch.object(example, "DaytonaRunner", return_value=runner) as constructor,
             redirect_stdout(io.StringIO()),
         ):
             await example.main()
         self.assertEqual(events, ["stream closed", "client closed"])
+        configs = [
+            config_from_values(call.kwargs["config"]) for call in runner.create_job.call_args_list
+        ]
+        self.assertEqual({config.learning_rate for config in configs}, {0.0003, 0.001})
+        self.assertEqual(len(configs), 12)
+        self.assertEqual({config.task for config in configs}, {"CartpoleSwingup"})
+        self.assertEqual(
+            {(config.learning_rate, config.entropy_cost, config.seed) for config in configs},
+            {
+                (lr, entropy_cost, seed)
+                for lr in (0.0003, 0.001)
+                for entropy_cost in (0.001, 0.01)
+                for seed in (11, 22, 33)
+            },
+        )
+        for config in configs:
+            self.assertEqual(config.backend, "gpu")
+            self.assertTrue(config.wandb)
+            self.assertGreaterEqual(config.total_steps, 7_864_320)
+            self.assertEqual(config.batch_size * config.num_minibatches % config.num_envs, 0)
+        self.assertEqual(constructor.call_args.kwargs["work_dir"], "phy_rl")
+        self.assertEqual(constructor.call_args.kwargs["entrypoint"], "train:run")
+        self.assertEqual(constructor.call_args.kwargs["resources"]["gpu"], 1)
+        self.assertEqual(constructor.call_args.kwargs["max_concurrent_jobs"], 2)
 
     async def test_preparation_failure_still_closes_the_client(self) -> None:
         error = RuntimeError("snapshot failed")
@@ -63,21 +88,20 @@ class ExampleTests(unittest.IsolatedAsyncioTestCase):
             await running.wait()
             return result
 
-        async def wait_until_cancelled() -> None:
+        async def run_until_cancelled() -> None:
             running.set()
-            await asyncio.Future()
-
-        async def cleanup_other(*, wait: bool) -> None:
-            await asyncio.sleep(0)
-            events.append("other cleaned")
+            try:
+                await asyncio.Future()
+            finally:
+                # A cancelled attempt still awaits the deletion of its sandbox.
+                await asyncio.sleep(0)
+                events.append("other cleaned")
 
         jobs = []
 
         def create_job(*, config: dict) -> SimpleNamespace:
             job = SimpleNamespace(
-                start=AsyncMock(),
-                wait=AsyncMock(side_effect=wait_until_cancelled if jobs else finish_first),
-                cleanup=AsyncMock(side_effect=cleanup_other if jobs else None),
+                run_attempt=AsyncMock(side_effect=run_until_cancelled if jobs else finish_first)
             )
             jobs.append(job)
             return job
@@ -95,13 +119,9 @@ class ExampleTests(unittest.IsolatedAsyncioTestCase):
         ):
             async with asyncio.timeout(5):
                 await example.main()
-        self.assertIn("other cleaned", events)
-        self.assertEqual(events[-1], "client closed")
-        for job in jobs:
-            if job.start.await_count:
-                job.cleanup.assert_awaited_once_with(wait=False)
-            else:
-                job.cleanup.assert_not_awaited()
+        started_others = sum(job.run_attempt.await_count for job in jobs[1:])
+        self.assertGreaterEqual(started_others, 1)
+        self.assertEqual(events, [*["other cleaned"] * started_others, "client closed"])
 
 
 @unittest.skipUnless(os.name == "posix", "SIGINT probe uses POSIX signals")

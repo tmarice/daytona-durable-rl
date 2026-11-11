@@ -6,14 +6,19 @@ import hashlib
 import os
 from pathlib import Path
 
-from phy_rl.results import write_json
+if __package__:
+    from .results import write_json
+else:
+    from results import write_json
 
 
 class WandbTracker:
-    def __init__(self, directory: Path):
+    def __init__(self, directory: Path, *, attempt_id: str) -> None:
         self.directory = directory.resolve()
+        self.attempt_id = attempt_id
         self.run = None
         self.identity = None
+        self._last_env_steps = 0
 
     def start(self, config, experiment_id: str, parameters: dict, previous: dict | None):
         # Import lazily so local training and the lightweight tests need no W&B.
@@ -61,26 +66,33 @@ class WandbTracker:
         }
         write_json(
             self.directory / "wandb.json",
-            {**self.identity, "url": self.run.url, "mode": mode, "attempt_id": self.directory.name},
+            {**self.identity, "url": self.run.url, "mode": mode, "attempt_id": self.attempt_id},
         )
         self.run.define_metric("env_steps")
         self.run.define_metric("*", step_metric="env_steps")
-        self.run.summary.update({"attempt_id": self.directory.name, "attempt_status": "running"})
+        self.run.summary.update({"attempt_id": self.attempt_id, "attempt_status": "running"})
         print(
             f"W&B: {self.run.url or 'offline logs in ' + str(self.directory / 'wandb')}", flush=True
         )
 
-    def log(self, env_steps: int, values: dict):
+    def log(self, env_steps: int, values: dict) -> None:
+        self._last_env_steps = int(env_steps)
         if self.run is not None:
             # Let W&B maintain its own monotonically increasing history step.
             # Environment steps may repeat after restoring an older checkpoint.
-            self.run.log({**values, "env_steps": int(env_steps), "attempt_id": self.directory.name})
+            self.run.log({**values, "env_steps": int(env_steps), "attempt_id": self.attempt_id})
 
     def evaluation(self, env_steps: int, phase: str, result: dict):
         values = {
             f"heldout/{phase}/{key}": result[key]
             for key in ("mean_return", "std_return", "mean_length")
         }
+        values.update(
+            {
+                f"heldout/{phase}/task/{name}": value
+                for name, value in result.get("task_metrics", {}).items()
+            }
+        )
         if "balance" in result:
             balance = result["balance"]
             values[f"heldout/{phase}/balance_success_rate"] = (
@@ -88,26 +100,27 @@ class WandbTracker:
             )
         self.log(env_steps, values)
 
-    def finish(self, status: str, summary: dict | None = None):
+    def finish(self, status: str, summary: dict | None = None) -> None:
         if self.run is None:
             return
         import wandb
 
         try:
-            self.run.summary.update({"attempt_status": status, "attempt_id": self.directory.name})
+            self.run.summary.update({"attempt_status": status, "attempt_id": self.attempt_id})
             if summary is not None:
                 self.run.summary.update(summary)
-                media = {}
-                if (self.directory / "learning_curves.png").is_file():
-                    media["plots/learning_curves"] = wandb.Image(
-                        str(self.directory / "learning_curves.png")
-                    )
-                if (self.directory / "policy_comparison.mp4").is_file():
-                    media["policy/comparison"] = wandb.Video(
-                        str(self.directory / "policy_comparison.mp4"), format="mp4"
-                    )
-                if media:
-                    self.log(summary["actual_steps"], media)
+            media = {}
+            for name in ("learning_curves.png", "policy_comparison.png"):
+                path = self.directory / name
+                if path.is_file():
+                    media[f"plots/{path.stem}"] = wandb.Image(str(path))
+            if (self.directory / "policy_comparison.mp4").is_file():
+                media["policy/comparison"] = wandb.Video(
+                    str(self.directory / "policy_comparison.mp4"), format="mp4"
+                )
+            if media:
+                step = summary["actual_steps"] if summary is not None else self._last_env_steps
+                self.log(step, media)
             # Attempt subdirectories keep earlier attempts' files intact on resume.
             for name in (
                 "requested_config.json",
@@ -116,12 +129,16 @@ class WandbTracker:
                 "wandb.json",
                 "metrics.jsonl",
                 "metrics.csv",
+                "learning_curves.png",
                 "evaluation_before.json",
                 "evaluation_after.json",
+                "policy_comparison.png",
+                "policy_comparison.mp4",
                 "summary.json",
                 "status.json",
                 "checkpoint_status.json",
                 "video.json",
+                "error.txt",
             ):
                 path = self.directory / name
                 if path.is_file():

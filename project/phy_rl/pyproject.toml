@@ -7,6 +7,7 @@ dependencies = [
     "playground==0.2.0",
     # The vendored PPO trainer includes the JAX device-placement compatibility fix.
     "brax==0.14.2",
+    "jax[cuda12]==0.12.0.1; sys_platform == 'linux'",
     "matplotlib>=3.10,<4",
     "wandb>=0.31,<0.32",
     "python-dotenv>=1.1,<2",

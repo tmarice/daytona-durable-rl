@@ -5,8 +5,8 @@ explicit resume**. The workload is MuJoCo Playground's `CartpoleBalance`, simula
 using MJX-JAX and trained with a minimally adapted, pinned Brax PPO trainer.
 Optional Weights & Biases tracking reports metrics, evaluations, and videos.
 `daytona_test.py` runs a single sandbox experiment without checkpoints.
-`main.py` illustrates how to use the `daytona_runner.py` library, including
-Ctrl+C cleanup. The RL implementation lives in `phy_rl`.
+`main.py` runs a bounded GPU training sweep through the existing `daytona_runner.py`
+library, including Ctrl+C cleanup. The RL implementation lives in `phy_rl`.
 
 **Step 1 baseline:** the default policy balances Cartpole for **20 simulated
 seconds in all 32 held-out evaluation episodes**. The worst pole deviation is
@@ -113,18 +113,90 @@ by default. No volume or resume workflow is involved in `daytona_test.py`.
 The launcher uses the installed [Daytona Python SDK](https://www.daytona.com/docs/python-sdk)
 through its `v0` namespace.
 
-## Library usage example
+## GPU sweep through the existing runner
 
-`main.py` shows how a consumer configures `DaytonaRunner`, creates jobs from a
-parameter grid, and consumes their results. Adapt the work directory, example
-`physical_ai.main:train` entrypoint, and parameter grid to your own project.
-The work directory must contain the workload's own `pyproject.toml` and `uv.lock`;
-the root manifest here contains only the local runner dependencies.
+Set `DAYTONA_API_KEY` and the W&B settings below in `.env`, install the root
+dependencies, and run locally:
 
-The example uses `aclosing()` around the result stream and closes the runner in
-`finally`. Ctrl+C cancels unfinished jobs, awaits their sandbox deletion requests,
-and closes the SDK client before exiting with code 130. A second Ctrl+C can
-interrupt cleanup.
+```sh
+uv run --no-sync python main.py
+```
+
+This submits twelve independent CartpoleSwingup PPO training jobs: learning rates 0.0003
+and 0.001, entropy costs 0.001 and 0.01, and seeds 11, 22, and 33, in every
+combination. All runs use the same task, network
+architecture, and training budget. Change the single `task` value in `main.py`
+to sweep another supported task. Two spot H100 sandboxes run concurrently, with one
+GPU per job. Each Cartpole job requests 8,388,608 training steps, saves a full learner
+checkpoint every PPO update and at completion, and evaluates 32 held-out episodes
+before and after training.
+JAX must report the GPU backend; unavailable CUDA fails instead of falling back.
+
+The configuration uses `work_dir="phy_rl"` and `entrypoint="train:run"`. The runner
+uploads that directory and installs dependencies from its `pyproject.toml`.
+CUDA is a regular Linux dependency; no extra is required. The runner uses `uv.lock`
+for the snapshot cache key, but its pip installation does not enforce the lockfile.
+
+The CLI and runner configuration dictionaries select task-specific defaults from
+`phy_rl/tasks.py`, then apply explicit overrides. CartpoleBalance and
+CartpoleSwingup remain available with their existing defaults.
+
+| Task | Training steps | Parallel environments | Episode steps | PPO updates |
+| --- | ---: | ---: | ---: | ---: |
+| CheetahRun | 15,728,640 | 2,048 | 1,000 | 16 |
+| WalkerWalk | 7,864,320 | 2,048 | 1,000 | 8 |
+| Go1JoystickFlatTerrain | 16,384,000 | 8,192 | 1,000 | 100 |
+| PandaPickCube | 8,192,000 | 2,048 | 150 | 50 |
+
+PPO settings and network sizes follow the installed Playground 0.2.0 recipes,
+with shorter training budgets and fewer evaluations. Go1's actor uses `state`
+observations and its critic uses `privileged_state`. These are simulation
+experiments, not policies validated for physical robots. Neither convergence nor
+one-minute H100 runtime is established. Compilation, asset downloads, evaluation,
+checkpointing, and optional video encoding add to training time.
+
+Run an individual task locally on a CUDA machine:
+
+```sh
+uv run --project phy_rl --no-sync python -m phy_rl.train --task CheetahRun --gpu --wandb
+uv run --project phy_rl --no-sync python -m phy_rl.train --task PandaPickCube --gpu --video
+```
+
+Go1 and Panda download their robot assets from GitHub at Playground's pinned
+MuJoCo Menagerie revision. Only the selected robot is downloaded, including its
+license, into the attempt's `.assets` directory; git is not required. New attempts
+need network access for these downloads. Assets are not uploaded to W&B.
+
+Evaluation records each environment's metric averages over active steps, plus
+forward speed in m/s for Cheetah and Walker. These are also logged under
+`heldout/before/task/*` and `heldout/after/task/*` in W&B. Cartpole's balance
+criterion is applied only to CartpoleBalance.
+
+Checkpoints live at `/data/jobs/<job_id>/checkpoints` on the retained
+`experiment_volume`. Attempt metrics, plots, and summaries are written to the
+sandbox's local filesystem and uploaded to W&B before training returns. Jobs use
+the project and entity from the local environment and the runner forwards the API
+key as a secret, overwriting the stored `daytona-runner-WANDB_API_KEY` value on
+each run. The local entrypoint prints the runner's results and logs.
+
+Every runner attempt requests `spot=True`. While monitoring a job, spot eviction,
+stopping, and deletion all trigger cleanup and a replacement sandbox. The retry
+keeps the experiment ID and checkpoint directory, with a new attempt ID. GPU
+sandboxes are deleted when stopped, so a missing sandbox also triggers recovery.
+Use Ctrl+C to end the local runner; manually stopping a sandbox triggers a retry.
+Eviction while a sandbox is still being created is retried as well.
+
+Each attempt owns one sandbox named `job-<job_id>-<attempt prefix>` and deletes it
+when the attempt ends. The name lets the runner find and delete a sandbox whose
+creation timed out or was cancelled. A failed deletion is logged and left to the
+TTL; it does not replace the job's result.
+
+The runner retains its existing 65-minute sandbox TTL, with a separate
+1,200-second image-construction timeout. `aclosing()` and `finally`
+await sandbox deletion requests and close the SDK client on failure or Ctrl+C.
+A second Ctrl+C can interrupt cleanup. Controller-crash recovery and concurrent
+writers to the same checkpoint directory are deliberately deferred, as confirmed
+for this task. Snapshots and the volume are retained for reuse.
 
 ## Weights & Biases
 
@@ -160,14 +232,21 @@ rate. The run also receives the training configuration, final summary, learning
 curve image, explicit JSON/CSV result files, and `policy/comparison` video when
 `--video` is enabled. Checkpoint payloads remain local; W&B is not used for recovery.
 
+The runner example enables W&B for each job and passes the project/entity from
+the local environment. Every generated result file is uploaded under its attempt
+directory, including `metrics.jsonl`, `metrics.csv`, both evaluation JSON files,
+`summary.json`, the original plot PNGs, and video files when generated. The PNGs
+also appear as W&B images. Failed attempts upload available results and `error.txt`.
+Finalization waits for W&B to finish syncing before returning to the runner.
+
 ```sh
 # Inherits tracking settings and resumes the same online W&B run.
 uv run --project phy_rl --no-sync python -m phy_rl.train \
-  --resume runs/<attempt>/checkpoints/latest.json
+  --resume runs/<attempt>/checkpoints
 
 # Continue locally without tracking this attempt.
 uv run --project phy_rl --no-sync python -m phy_rl.train \
-  --resume runs/<attempt>/checkpoints/latest.json --no-wandb
+  --resume runs/<attempt>/checkpoints --no-wandb
 ```
 
 The checkpoint retains the W&B run ID, project, and entity. Resumed attempts keep
@@ -208,7 +287,10 @@ is displayed alongside the control input, cart position, and cumulative return.
 
 Video encoding requires `ffmpeg` on `PATH` with the `libx264` encoder (already
 available in this workspace). Rendering uses Matplotlib on CPU and needs no
-OpenGL display. This is a 2D visualization, not MuJoCo's native 3D renderer.
+OpenGL display. Cartpole uses the existing 2D visualization. The four new tasks
+use a 3D view of body links and primitive geometry reconstructed from the recorded
+MuJoCo positions, including Panda's target. These are schematic views, not native
+textured MuJoCo renders. New-task videos show the first two held-out episodes.
 Recording compares the policy at the start and end of this attempt. On resume,
 the starting policy is restored from the checkpoint. A completed checkpoint can
 also be loaded with `--resume ... --video`; this performs evaluation/video only,
@@ -222,9 +304,8 @@ with the same task and seed never overwrite each other.
 | `requested_config.json` | Effective inputs, including inherited resume settings |
 | `attempt.json` | Experiment/attempt identity, starting progress, source checkpoint |
 | `wandb.json` | W&B run ID, destination, URL, and mode when tracking is enabled |
-| `checkpoints/update-*/state.msgpack` | Full learner state and random keys |
-| `checkpoints/update-*/manifest.json` | Progress, configuration, payload size and SHA-256 |
-| `checkpoints/latest.json` | Atomically published pointer to the latest committed checkpoint |
+| `checkpoints/checkpoint-*.json` | Session IDs, progress/configuration, and base64-encoded full learner state with size and SHA-256 |
+| `checkpoints/checkpoint-*.json.complete` | Empty marker indicating that the JSON file was fully written and closed |
 | `checkpoint_status.json` | Latest save location, progress, and save duration |
 | `resolved_config.json` | Task settings, PPO settings, network architecture, installed versions, and device |
 | `metrics.jsonl` | Progress observations, flushed after each callback |
@@ -300,15 +381,17 @@ uv run --project phy_rl --no-sync python -m phy_rl.train --checkpoint-interval-s
 
 # After interrupting a run, resume its latest committed checkpoint.
 uv run --project phy_rl --no-sync python -m phy_rl.train \
-  --resume runs/<attempt>/checkpoints/latest.json
+  --resume runs/<attempt>/checkpoints
 ```
 
 The interval must be a positive integer. Saves occur at absolute update counts
 that are multiples of the interval. The final update is always saved, even when
 it is not a multiple. All checkpoints are retained; frequent saves use more disk
-space and add synchronous serialization/fsync overhead.
+space and add synchronous serialization and write overhead.
 
-`--resume` also accepts a checkpoint directory or an explicit `manifest.json`.
+`--resume` accepts a checkpoint directory or an explicit `checkpoint-*.json` file.
+The file must have its companion `.complete` marker. Legacy `manifest.json` /
+`latest.json` checkpoints are unsupported; existing files are left untouched.
 It inherits the task, seed, hyperparameters, evaluation schedule, and original
 training target. Conflicting training overrides are rejected. Runtime options
 `--output`, `--video`, `--checkpoint-interval-steps`, and `--cpu`/`--gpu` may change. For example,
@@ -316,7 +399,7 @@ resuming at 3,145,728 of 8,388,608 environment steps continues toward 8,388,608;
 it does not request another 8,388,608 steps. Existing Brax batch/epoch rounding
 still applies. A checkpoint already at the target performs no additional updates.
 
-Every launch creates a new attempt directory and keeps the experiment identity.
+Every launch creates a new attempt directory; resumed attempts keep the experiment identity.
 Metrics use absolute environment-step counts; earlier attempts remain intact,
 including observations of work subsequently lost after the last checkpoint.
 `evaluation_before.json` identifies whether the attempt began with a random or
@@ -328,18 +411,64 @@ its committed checkpoints remain usable for manual resume.
 Each checkpoint contains policy/value parameters, Adam moments and counters,
 normalization state, completed environment steps, training PRNG streams,
 evaluation RNG, and environment reset keys. Save uses Flax MessagePack
-serialization, already supplied by the training dependencies. No pickle is used.
+serialization, already supplied by the training dependencies, then base64-encodes
+the bytes inside the session JSON dictionary. No pickle is used.
 The current learning rate is constant; there is no separate scheduler state.
 Simulator episodes reset on resume. Exact trajectory replay is not guaranteed.
 Compilation and evaluation setup happen again in each process.
 
-Payloads and manifests are written and fsynced in a temporary directory, renamed
-to an immutable checkpoint directory, and then published through an atomic
-replacement of `latest.json`. Loads verify size, SHA-256, format, configuration,
-dependency versions, trainer source, and array shapes/dtypes. Temporary directories
-are ignored. A corrupt selected checkpoint fails clearly; an older valid manifest
-can be selected explicitly. These guarantees currently cover the local filesystem;
-Daytona Volume persistence will be verified separately in step 4.
+`ExperimentSession` writes a uniquely named, sequentially numbered JSON file,
+closes it, then creates its empty completion marker. Restore selects the highest
+committed sequence; files without markers are ignored. This uses sequential writes
+without symlinks, renames, or a mutable latest pointer. Loads verify size, SHA-256,
+format, configuration, dependency versions, trainer source, and array shapes/dtypes.
+A corrupt selected checkpoint fails clearly; an older valid JSON file can be
+selected explicitly. Mounted-volume persistence across sandbox deletion still
+requires separate live verification.
+
+## ExperimentSession integration
+
+`ExperimentSession` lives in `phy_rl/daytona_experiment_session.py` and can be imported without the
+Daytona SDK. It accepts JSON-compatible dictionaries; workload-specific serialization
+belongs in the training code.
+
+```python
+from phy_rl.daytona_experiment_session import ExperimentSession
+
+session = ExperimentSession("experiment-1", "attempt-2", "/data/jobs/experiment-1/checkpoints")
+previous = session.restore_checkpoint()  # dict, or None before the first save
+path = session.save_checkpoint({"step": 100, "loss": 0.25})
+```
+
+Every training invocation constructs a session, including the local CLI. The
+runner calls an entry point with the contract:
+
+```python
+run(
+    config,
+    experiment_id="experiment-1",
+    attempt_id="attempt-2",
+    checkpoint_dir="/data/jobs/experiment-1/checkpoints",
+)
+```
+
+`phy_rl.train.run` accepts a `Config` or a configuration dictionary and optional
+identity/storage keywords. `DaytonaJob` supplies its stable job ID as `experiment_id`,
+a fresh `attempt_id` on each launch, and the same `/data/jobs/<job_id>/checkpoints`
+directory across retries. The session is passed into training and its IDs are used
+in attempt metadata, summaries, checkpoints, and W&B reporting.
+
+An explicit `resume` selects that checkpoint; otherwise, a supplied checkpoint
+directory is searched automatically. Missing checkpoints start fresh. Disabling
+checkpoint saves still permits restoration. Local calls without identity arguments
+generate a new attempt directory and save checkpoints inside it; explicit local
+resume inherits the saved experiment ID. Supplied attempt IDs name their output
+directories, and reusing an existing attempt directory is rejected.
+
+The session assumes one active writer per experiment. Concurrent writer coordination,
+visibility retries, automatic fallback from corrupt checkpoints, and retention cleanup
+are intentionally deferred. Checkpoints use the supplied directory; other attempt
+artifacts use `output` (default `runs`) and are uploaded when W&B is enabled.
 
 Brax's upstream checkpoint API saves network/normalizer parameters but omits the
 optimizer and progress/RNG state. The small trainer adaptation is documented in
@@ -365,6 +494,17 @@ After dependencies are installed, run a real, short CPU smoke test:
 RUN_MUJOCO_SMOKE=1 uv run --project phy_rl --no-sync \
   python -m unittest tests.test_training_smoke -v
 ```
+
+Exercise all four new tasks with real, small CPU training runs, video generation,
+and a second attempt restored from the first checkpoint (requires ffmpeg and
+GitHub access for the robot assets):
+
+```sh
+RUN_MUJOCO_TASKS=1 uv run --project phy_rl --no-sync \
+  python -m unittest tests.test_task_training -v
+```
+
+These tests verify execution and resume, not learned task proficiency or H100 speed.
 
 Then run the default command above and inspect its retained results. The smoke
 tests check genuine policy updates, CPU execution, evaluation/plot artifacts, and
@@ -392,11 +532,35 @@ replayed environment steps. Live upload verification was blocked by this agent
 environment's restriction on the local sockets required by `wandb-core`; these
 tests do not establish dashboard connectivity.
 
+Session integration verified locally on 2026-11-11: 36 lightweight tests and all
+six opt-in CPU tests passed. Coverage includes interrupted JSON publication,
+retry identities, automatic shared-directory resume with saving disabled,
+SIGKILL/full-state recovery, and W&B reporting with its remote transport mocked.
+No Daytona sandbox was launched for this verification.
+
+Runner sweep verification on 2026-11-11: all 40 lightweight tests and seven real
+CPU tests passed. The new subprocess test trains through the sweep adapter,
+checks durable attempt artifacts, and restores the checkpoint from a fresh reader
+process. The GPU image built successfully with the pinned CUDA dependencies
+(snapshot `716816667aa48395b3654874e062bcb8535dc02e4a351cca8e0f0a7e140c1f07`).
+Both H100 sandbox creation requests were rejected with HTTP 400:
+`Organization doesn't have GPU credits. Add more by visiting the Wallet page`.
+GPU execution is therefore still unverified.
+
+Additional task support verified locally on 2026-11-11: 50 focused unit tests,
+the four new task training/video/resume tests, a numerical evaluation-metric test,
+and the existing Cartpole/W&B training regression passed. These are small CPU
+execution checks; H100 throughput and learned task proficiency remain unmeasured.
+Tests for the removed `main.py` staging helpers and CLI/report interface have been
+removed. The current grid and source packaging are covered by `test_main` and
+`test_workdir`; live Daytona end-to-end coverage needs a new test for the current
+entrypoint.
+
 ## Milestone boundary
 
-Step 2 implements local checkpoint saving and manual resume. **Ask for confirmation
-before implementing step 3 (manual Daytona training)**. Follow the explicit
-confirmation rule between later steps in [the reduced V1 plan](codex_plan_2.md).
+The current task authorizes the bounded runner-based GPU sweep and end-to-end
+verification above. Broader controller restart recovery and orchestration from
+[the reduced V1 plan](codex_plan_2.md) remain outside this task.
 
 Upstream references:
 

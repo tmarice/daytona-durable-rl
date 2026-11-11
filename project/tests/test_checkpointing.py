@@ -4,20 +4,19 @@ import contextlib
 import dataclasses
 import io
 import json
-import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest import mock
 
 from phy_rl.checkpointing import commit_checkpoint, read_checkpoint
+from phy_rl.daytona_experiment_session import ExperimentSession
 from phy_rl.train import Config, config_values, parse_args
 
 
 class CheckpointTests(unittest.TestCase):
     def commit(self, root, payload=b"complete state", update=1):
         return commit_checkpoint(
-            root,
+            ExperimentSession("experiment", "attempt", root),
             payload,
             env_steps=update * 64,
             completed_updates=update,
@@ -30,74 +29,30 @@ class CheckpointTests(unittest.TestCase):
             first = self.commit(root)
             second = self.commit(root, b"next state", update=2)
             self.assertEqual(read_checkpoint(first).payload, b"complete state")
-            for path in (root, root / "latest.json", second.parent, second):
+            for path in (root, second):
                 with self.subTest(path=path):
                     checkpoint = read_checkpoint(path)
                     self.assertEqual(checkpoint.payload, b"next state")
                     self.assertEqual(checkpoint.manifest["env_steps"], 128)
 
-    def test_interruption_at_each_publish_stage_preserves_previous_checkpoint(self):
-        for fail_on in ("payload", "manifest", "directory", "pointer_write", "pointer_publish"):
-            with self.subTest(stage=fail_on), tempfile.TemporaryDirectory() as temporary:
-                from phy_rl import checkpointing
-
-                root = Path(temporary)
-                previous = self.commit(root)
-                original_write = checkpointing._write_synced
-                original_replace = os.replace
-
-                def write(path, data, fail_on=fail_on, original_write=original_write):
-                    if (
-                        fail_on == "payload"
-                        and path.name == "state.msgpack"
-                        or fail_on == "manifest"
-                        and path.name == "manifest.json"
-                        or fail_on == "pointer_write"
-                        and path.name.endswith(".tmp")
-                    ):
-                        path.write_bytes(data[:3])
-                        raise OSError("interrupted write")
-                    original_write(path, data)
-
-                def replace(
-                    source, destination, fail_on=fail_on, original_replace=original_replace
-                ):
-                    if (
-                        fail_on == "directory"
-                        and source.is_dir()
-                        or fail_on == "pointer_publish"
-                        and destination.name == "latest.json"
-                    ):
-                        raise OSError("interrupted publication")
-                    original_replace(source, destination)
-
-                with (
-                    mock.patch.object(checkpointing, "_write_synced", side_effect=write),
-                    mock.patch.object(checkpointing.os, "replace", side_effect=replace),
-                    self.assertRaises(OSError),
-                ):
-                    self.commit(root, b"new state", update=2)
-                self.assertEqual(read_checkpoint(root).path, previous.resolve())
-                self.assertEqual(read_checkpoint(root).payload, b"complete state")
-
     def test_corruption_and_uncommitted_directories_are_rejected(self):
         for mode in ("truncated", "checksum", "manifest", "missing", "version"):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
-                manifest = self.commit(root)
-                payload = manifest.parent / "state.msgpack"
+                path = self.commit(root)
+                envelope = json.loads(path.read_text())
+                document = envelope["data"]
                 if mode == "truncated":
-                    payload.write_bytes(b"short")
+                    document["payload_base64"] = "c2hvcnQ="
                 elif mode == "checksum":
-                    payload.write_bytes(b"x" * payload.stat().st_size)
+                    document["payload_sha256"] = "wrong"
                 elif mode == "manifest":
-                    manifest.write_text("{}")
+                    envelope["data"] = {}
                 elif mode == "version":
-                    document = json.loads(manifest.read_text())
                     document["format_version"] = 999
-                    manifest.write_text(json.dumps(document))
                 else:
-                    payload.unlink()
+                    del document["payload_base64"]
+                path.write_text(json.dumps(envelope))
                 with self.assertRaises(ValueError):
                     read_checkpoint(root)
         with tempfile.TemporaryDirectory() as temporary, self.assertRaises(ValueError):

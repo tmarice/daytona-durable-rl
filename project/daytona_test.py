@@ -1,7 +1,6 @@
 """Run CartpoleBalance in a disposable Daytona sandbox without checkpoints."""
 
 import argparse
-import tomllib
 from pathlib import Path
 
 from daytona import Daytona
@@ -37,12 +36,6 @@ def main():
         image = image.add_local_file(source, f"/app/phy_rl/{source.name}")
     resources = Resources(cpu=4, memory=8, disk=10)
     if args.gpu:
-        lock = tomllib.loads((training_root / "uv.lock").read_text())
-        jax_version = next(p["version"] for p in lock["package"] if p["name"] == "jax")
-        image = image.run_commands(
-            f"uv pip install --python /app/.venv/bin/python 'jax[cuda12]=={jax_version}' "
-            "&& uv cache clean"
-        )
         resources = Resources(cpu=4, memory=8, disk=20, gpu=1, gpu_type=GpuType.H100)
 
     with Daytona() as daytona:
