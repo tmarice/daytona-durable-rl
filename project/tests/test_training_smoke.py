@@ -11,9 +11,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from daytona_runner.checkpointing import read_checkpoint
-from daytona_runner.evaluation import evaluate_policy
-from daytona_runner.train import Config, parse_args, run
+from phy_rl.checkpointing import read_checkpoint
+from phy_rl.evaluation import evaluate_policy
+from phy_rl.train import Config, parse_args, run
 
 
 @unittest.skipUnless(
@@ -23,9 +23,7 @@ class RealTrainingTests(unittest.TestCase):
     def test_training_without_checkpoints_never_serializes_state(self):
         with (
             tempfile.TemporaryDirectory() as root,
-            mock.patch(
-                "daytona_runner.train.save_state", side_effect=AssertionError("Saved state")
-            ),
+            mock.patch("phy_rl.train.save_state", side_effect=AssertionError("Saved state")),
         ):
             directory = run(
                 Config(
@@ -137,7 +135,7 @@ class RealTrainingTests(unittest.TestCase):
             "actions": np.zeros((4, 3, 1)),
             "length": np.array([2, 2, 2, 1]),  # Last episode stopped early.
         }
-        with mock.patch("daytona_runner.evaluation.capture_rollouts", return_value=rollouts):
+        with mock.patch("phy_rl.evaluation.capture_rollouts", return_value=rollouts):
             result, filmed = evaluate_policy(
                 SimpleNamespace(dt=0.01), None, None, Config(episode_length=2, eval_episodes=4)
             )
@@ -201,7 +199,7 @@ class RealTrainingTests(unittest.TestCase):
                 """
 import os, signal
 from unittest.mock import patch
-from daytona_runner import train
+from phy_rl import train
 save = train.save_state
 def save_then_kill(*args, **kwargs):
     save(*args, **kwargs)
@@ -252,8 +250,8 @@ import os
 from pathlib import Path
 from flax import serialization
 from unittest.mock import patch
-from daytona_runner.checkpointing import Checkpoint
-from daytona_runner import train
+from phy_rl.checkpointing import Checkpoint
+from phy_rl import train
 restore = Checkpoint.restore
 def audited_restore(self, template):
     state = restore(self, template)
@@ -298,7 +296,7 @@ with patch.object(Checkpoint, 'restore', audited_restore):
             self.assertEqual(int(adam["count"]), 8 * 2 * 2)
 
             completed = execute(
-                "from daytona_runner.train import main; raise SystemExit(main())",
+                "from phy_rl.train import main; raise SystemExit(main())",
                 ["--resume", str(final.path)],
             )
             self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)

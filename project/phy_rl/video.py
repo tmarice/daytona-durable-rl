@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from pathlib import Path
 
-from daytona_runner.results import write_json
+from phy_rl.results import write_json
 
 
 def write_comparison(env, before: dict, after: dict, config, directory: Path) -> dict:

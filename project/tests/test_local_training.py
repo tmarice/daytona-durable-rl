@@ -14,8 +14,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from daytona_runner.results import Metrics, create_run_directory
-from daytona_runner.train import Config, initialize_jax, parse_args, ppo_settings, run
+from phy_rl.results import Metrics, create_run_directory
+from phy_rl.train import Config, initialize_jax, parse_args, ppo_settings, run
 
 
 class ConfigurationTests(unittest.TestCase):
@@ -61,7 +61,7 @@ class ConfigurationTests(unittest.TestCase):
         self.assertIn("divisible", stderr.getvalue())
 
     def test_checkpoint_saving_can_be_disabled_without_changing_training(self):
-        from daytona_runner.train import training_config
+        from phy_rl.train import training_config
 
         default = parse_args([])
         disabled = parse_args(["--no-checkpoints"])
@@ -161,7 +161,7 @@ class RunLifecycleTests(unittest.TestCase):
                     raise error
 
                 with (
-                    mock.patch("daytona_runner.train.train", side_effect=fake_training),
+                    mock.patch("phy_rl.train.train", side_effect=fake_training),
                     self.assertRaises(type(error)),
                 ):
                     run(dataclasses.replace(Config(), output=Path(root)))
@@ -184,7 +184,7 @@ class RunLifecycleTests(unittest.TestCase):
                 }
 
             with (
-                mock.patch("daytona_runner.train.train", side_effect=fake_training),
+                mock.patch("phy_rl.train.train", side_effect=fake_training),
                 mock.patch.object(Metrics, "plot"),
             ):
                 directory = run(dataclasses.replace(Config(), output=Path(root)))

@@ -5,7 +5,8 @@ explicit resume**. The workload is MuJoCo Playground's `CartpoleBalance`, simula
 using MJX-JAX and trained with a minimally adapted, pinned Brax PPO trainer.
 Optional Weights & Biases tracking reports metrics, evaluations, and videos.
 `daytona_test.py` runs a single sandbox experiment without checkpoints.
-There is no experiment scheduler yet.
+`main.py` illustrates how to use the `daytona_runner.py` library, including
+Ctrl+C cleanup. The RL implementation lives in `phy_rl`.
 
 **Step 1 baseline:** the default policy balances Cartpole for **20 simulated
 seconds in all 32 held-out evaluation episodes**. The worst pole deviation is
@@ -17,26 +18,34 @@ measurements below are from the retained step 1 run.
 
 ## Install and run
 
-From this directory:
+The runner and RL training are independent uv projects, each with its own
+`pyproject.toml`, `uv.lock`, and environment:
+
+- The root project installs Daytona and dotenv for the runner and sandbox launchers.
+- `phy_rl` installs Playground, Brax, Matplotlib, W&B, and dotenv for training.
+
+Run all commands below from this directory. In Nix/devenv, unset the shared
+environment override first so syncing one project does not replace the other's
+dependencies:
 
 ```sh
-uv sync --locked --python 3.14
-uv run --no-sync python -m daytona_runner.train
+unset UV_PROJECT_ENVIRONMENT
+uv sync --locked --python 3.14                  # Runner: .venv
+uv sync --project phy_rl --locked --python 3.14  # Training: phy_rl/.venv
+uv run --project phy_rl --no-sync python -m phy_rl.train
 ```
 
-Python 3.14 is the selected runtime. In this workspace, Nix/devenv sets
-`UV_PROJECT_ENVIRONMENT` to the parent `.devenv/state/venv`; the commands above
-use that environment. Outside devenv, uv defaults to a project-local `.venv`.
-To use a separate environment here, prefix both commands with
-`UV_PROJECT_ENVIRONMENT=.venv`. Use `uv run --no-sync` to select the installed
-environment even when a previously opened shell still points to Python 3.15.
-No cloud credentials are needed for local training.
+Python 3.14 is the selected runtime. Use `--project phy_rl` to select the training
+environment while keeping the repository root as the working directory, so module
+imports and existing `runs/` paths continue to work. No cloud credentials are
+needed for local training. Both projects install dependencies only; source code
+runs directly from the checkout.
 
 Select the training device with mutually exclusive flags:
 
 ```sh
-uv run --no-sync python -m daytona_runner.train --cpu  # Default when omitted
-uv run --no-sync python -m daytona_runner.train --gpu  # NVIDIA CUDA
+uv run --project phy_rl --no-sync python -m phy_rl.train --cpu  # Default when omitted
+uv run --project phy_rl --no-sync python -m phy_rl.train --gpu  # NVIDIA CUDA
 ```
 
 `--gpu` requires an available NVIDIA GPU and a compatible CUDA-enabled JAX
@@ -46,10 +55,10 @@ devices in an already initialized Python process requires starting a new process
 GPU training has not yet been verified on Daytona. GPU installation requirements:
 [JAX documentation](https://docs.jax.dev/en/latest/installation.html).
 
-The Playground and Brax releases are pinned in `pyproject.toml`,
-and `uv.lock` records the resolved dependencies. Use `uv sync --locked` to retain
-that resolution. The released `playground==0.2.0` exposes the
-JAX/MJX API used here; this project does not follow Playground's changing GitHub
+The Playground and Brax releases are pinned in `phy_rl/pyproject.toml`,
+and `phy_rl/uv.lock` records the resolved training dependencies. Use
+`uv sync --project phy_rl --locked` to retain that resolution. The released
+`playground==0.2.0` exposes the JAX/MJX API used here; this project does not follow Playground's changing GitHub
 main branch. Brax is installed from the published `brax==0.14.2` wheel.
 The vendored PPO trainer is derived from upstream revision
 `303d89dfac42919e5fde7c91f24c28a505373b24` and includes its fix for removed JAX
@@ -64,7 +73,7 @@ to CPU execution and uses 64-by-64 policy/value networks.
 Explicit settings matching the default:
 
 ```sh
-uv run --no-sync python -m daytona_runner.train \
+uv run --project phy_rl --no-sync python -m phy_rl.train \
   --task CartpoleBalance --seed 11 \
   --total-steps 8388608 --num-envs 128 --episode-length 2000 \
   --learning-rate 0.001 --entropy-cost 0.01 \
@@ -89,8 +98,9 @@ uv run --no-sync python daytona_test.py        # 4 CPUs, 8 GiB RAM
 uv run --no-sync python daytona_test.py --gpu  # One H100; requires GPU access
 ```
 
-The script builds a Python 3.14 image using `uv.lock`, runs the default
-`CartpoleBalance` training with **all checkpoint saves disabled**, downloads
+The script builds a Python 3.14 image using `phy_rl/pyproject.toml` and
+`phy_rl/uv.lock`, runs the default `CartpoleBalance` training with **all checkpoint
+saves disabled**, downloads
 metrics and evaluation results to `runs/daytona-<sandbox-id>.tar.gz`, and deletes
 the sandbox in `finally`. Training has a one-hour timeout and the sandbox has a
 65-minute lifetime limit. Output is printed when training finishes. Use
@@ -103,9 +113,23 @@ by default. No volume or resume workflow is involved in `daytona_test.py`.
 The launcher uses the installed [Daytona Python SDK](https://www.daytona.com/docs/python-sdk)
 through its `v0` namespace.
 
+## Library usage example
+
+`main.py` shows how a consumer configures `DaytonaRunner`, creates jobs from a
+parameter grid, and consumes their results. Adapt the work directory, example
+`physical_ai.main:train` entrypoint, and parameter grid to your own project.
+The work directory must contain the workload's own `pyproject.toml` and `uv.lock`;
+the root manifest here contains only the local runner dependencies.
+
+The example uses `aclosing()` around the result stream and closes the runner in
+`finally`. Ctrl+C cancels unfinished jobs, awaits their sandbox deletion requests,
+and closes the SDK client before exiting with code 130. A second Ctrl+C can
+interrupt cleanup.
+
 ## Weights & Biases
 
-Install the updated dependencies with `uv sync --locked --python 3.14`. Set
+Install the training dependencies with
+`uv sync --project phy_rl --locked --python 3.14`. Set
 `WANDB_API_KEY` in `.env`, along with the destination:
 
 ```dotenv
@@ -117,7 +141,7 @@ WANDB_PROJECT="Daytona test"
 Then enable tracking:
 
 ```sh
-uv run --no-sync python -m daytona_runner.train --wandb --video
+uv run --project phy_rl --no-sync python -m phy_rl.train --wandb --video
 ```
 
 The script loads `.env` from the working directory, falling back to this project's
@@ -138,11 +162,11 @@ curve image, explicit JSON/CSV result files, and `policy/comparison` video when
 
 ```sh
 # Inherits tracking settings and resumes the same online W&B run.
-uv run --no-sync python -m daytona_runner.train \
+uv run --project phy_rl --no-sync python -m phy_rl.train \
   --resume runs/<attempt>/checkpoints/latest.json
 
 # Continue locally without tracking this attempt.
-uv run --no-sync python -m daytona_runner.train \
+uv run --project phy_rl --no-sync python -m phy_rl.train \
   --resume runs/<attempt>/checkpoints/latest.json --no-wandb
 ```
 
@@ -170,7 +194,7 @@ To watch the policy control the cart and pole, record a before/after video durin
 the training run:
 
 ```sh
-uv run --no-sync python -m daytona_runner.train --video
+uv run --project phy_rl --no-sync python -m phy_rl.train --video
 ```
 
 This produces `policy_comparison.mp4`: a side-by-side 2D view of actual MuJoCo
@@ -269,13 +293,13 @@ control checkpoint frequency.
 
 ```sh
 # Save every update (the default).
-uv run --no-sync python -m daytona_runner.train
+uv run --project phy_rl --no-sync python -m phy_rl.train
 
 # Save every five completed PPO updates.
-uv run --no-sync python -m daytona_runner.train --checkpoint-interval-steps 5
+uv run --project phy_rl --no-sync python -m phy_rl.train --checkpoint-interval-steps 5
 
 # After interrupting a run, resume its latest committed checkpoint.
-uv run --no-sync python -m daytona_runner.train \
+uv run --project phy_rl --no-sync python -m phy_rl.train \
   --resume runs/<attempt>/checkpoints/latest.json
 ```
 
@@ -319,13 +343,13 @@ Daytona Volume persistence will be verified separately in step 4.
 
 Brax's upstream checkpoint API saves network/normalizer parameters but omits the
 optimizer and progress/RNG state. The small trainer adaptation is documented in
-[the vendor notes](daytona_runner/_vendor/README.md). It retains the existing PPO
+[the vendor notes](phy_rl/_vendor/README.md). It retains the existing PPO
 math and supports one process/device. Checkpoint compatibility is deliberately
 strict: different trainer source or dependency versions require a new experiment.
 
 ## Verification
 
-The lightweight tests require only Python's standard library:
+Run the lightweight suite in the root environment (runner tests use the Daytona SDK):
 
 ```sh
 uv run --no-sync python -m unittest discover -s tests -v
@@ -338,7 +362,7 @@ They mock training explicitly and do not establish RL compatibility.
 After dependencies are installed, run a real, short CPU smoke test:
 
 ```sh
-RUN_MUJOCO_SMOKE=1 uv run --no-sync \
+RUN_MUJOCO_SMOKE=1 uv run --project phy_rl --no-sync \
   python -m unittest tests.test_training_smoke -v
 ```
 

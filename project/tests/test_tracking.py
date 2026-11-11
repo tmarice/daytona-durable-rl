@@ -10,9 +10,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from daytona_runner.checkpointing import commit_checkpoint
-from daytona_runner.tracking import WandbTracker
-from daytona_runner.train import Config, config_values, parse_args, run, training_config
+from phy_rl.checkpointing import commit_checkpoint
+from phy_rl.tracking import WandbTracker
+from phy_rl.train import Config, config_values, parse_args, run, training_config
 
 
 class TrackingTests(unittest.TestCase):
@@ -95,8 +95,8 @@ class TrackingTests(unittest.TestCase):
             with (
                 self.subTest(status=status),
                 tempfile.TemporaryDirectory() as root,
-                mock.patch("daytona_runner.train.WandbTracker") as tracker,
-                mock.patch("daytona_runner.train.train", side_effect=error),
+                mock.patch("phy_rl.train.WandbTracker") as tracker,
+                mock.patch("phy_rl.train.train", side_effect=error),
             ):
                 tracker.return_value.finish.side_effect = RuntimeError("upload failed")
                 with self.assertRaises(type(error)) as caught:

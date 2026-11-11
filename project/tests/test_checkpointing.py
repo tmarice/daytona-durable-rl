@@ -10,8 +10,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from daytona_runner.checkpointing import commit_checkpoint, read_checkpoint
-from daytona_runner.train import Config, config_values, parse_args
+from phy_rl.checkpointing import commit_checkpoint, read_checkpoint
+from phy_rl.train import Config, config_values, parse_args
 
 
 class CheckpointTests(unittest.TestCase):
@@ -39,7 +39,7 @@ class CheckpointTests(unittest.TestCase):
     def test_interruption_at_each_publish_stage_preserves_previous_checkpoint(self):
         for fail_on in ("payload", "manifest", "directory", "pointer_write", "pointer_publish"):
             with self.subTest(stage=fail_on), tempfile.TemporaryDirectory() as temporary:
-                from daytona_runner import checkpointing
+                from phy_rl import checkpointing
 
                 root = Path(temporary)
                 previous = self.commit(root)

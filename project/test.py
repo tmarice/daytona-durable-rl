@@ -25,7 +25,7 @@ def get_or_create_gpu_snapshot(daytona: Daytona, snapshot_name: str):
             CreateSnapshotParams(
                 name=snapshot_name,
                 image=Image.base("python:3.12").pip_install_from_pyproject(
-                    "pyproject.toml",
+                    "phy_rl/pyproject.toml",
                     optional_dependencies=[],  # optional dependencies parameter is not optional :)
                 ),
                 resources=Resources(cpu=1, memory=1, disk=1, gpu=1, gpu_type=GpuType.H100),

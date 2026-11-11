@@ -9,7 +9,7 @@ from daytona.v0 import CreateSandboxFromImageParams, Image, Resources
 from daytona.v0.common.sandbox import GpuType
 from dotenv import load_dotenv
 
-from daytona_runner.train import Config
+from phy_rl.train import Config
 
 
 def main():
@@ -21,20 +21,23 @@ def main():
         parser.error("--total-steps must be positive")
 
     root = Path(__file__).resolve().parent
+    training_root = root / "phy_rl"
     load_dotenv(root / ".env")
     image = (
         Image.base("python:3.14-slim-bookworm")
         .run_commands("apt-get update && apt-get install -y --no-install-recommends git libgl1")
         .pip_install("uv==0.13.4")
         .workdir("/app")
-        .add_local_file(root / "pyproject.toml", "/app/pyproject.toml")
-        .add_local_file(root / "uv.lock", "/app/uv.lock")
+        .add_local_file(training_root / "pyproject.toml", "/app/pyproject.toml")
+        .add_local_file(training_root / "uv.lock", "/app/uv.lock")
         .run_commands("uv sync --locked --no-dev && uv cache clean")
-        .add_local_dir(root / "daytona_runner", "/app/daytona_runner")
+        .add_local_dir(training_root / "_vendor", "/app/phy_rl/_vendor")
     )
+    for source in training_root.glob("*.py"):
+        image = image.add_local_file(source, f"/app/phy_rl/{source.name}")
     resources = Resources(cpu=4, memory=8, disk=10)
     if args.gpu:
-        lock = tomllib.loads((root / "uv.lock").read_text())
+        lock = tomllib.loads((training_root / "uv.lock").read_text())
         jax_version = next(p["version"] for p in lock["package"] if p["name"] == "jax")
         image = image.run_commands(
             f"uv pip install --python /app/.venv/bin/python 'jax[cuda12]=={jax_version}' "
@@ -57,7 +60,7 @@ def main():
         try:
             print(f"Sandbox: {sandbox.id}; training started (up to 60 minutes).", flush=True)
             result = sandbox.process.exec(
-                "/app/.venv/bin/python -u -m daytona_runner.train "
+                "/app/.venv/bin/python -u -m phy_rl.train "
                 f"--task CartpoleBalance --{'gpu' if args.gpu else 'cpu'} "
                 f"--total-steps {args.total_steps} --no-checkpoints --output /app/runs",
                 cwd="/app",

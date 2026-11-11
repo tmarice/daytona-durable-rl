@@ -18,10 +18,10 @@ import traceback
 from dataclasses import dataclass
 from pathlib import Path
 
-from daytona_runner.checkpointing import read_checkpoint, save_state
-from daytona_runner.evaluation import evaluate_policy
-from daytona_runner.results import Metrics, create_run_directory, write_json
-from daytona_runner.tracking import WandbTracker
+from phy_rl.checkpointing import read_checkpoint, save_state
+from phy_rl.evaluation import evaluate_policy
+from phy_rl.results import Metrics, create_run_directory, write_json
+from phy_rl.tracking import WandbTracker
 
 
 @dataclass(frozen=True)
@@ -278,7 +278,7 @@ def train(
     from brax.training.agents.ppo import networks as ppo_networks
     from mujoco_playground import registry, wrapper
 
-    from daytona_runner._vendor import brax_ppo as ppo
+    from phy_rl._vendor import brax_ppo as ppo
 
     env_config = registry.get_default_config(config.task)
     env_config.impl = "jax"
@@ -486,7 +486,7 @@ def train(
         "latest_checkpoint": latest_checkpoint,
     }
     if config.video:
-        from daytona_runner.video import write_comparison
+        from phy_rl.video import write_comparison
 
         summary["video"] = write_comparison(
             eval_env, initial_rollouts, final_rollouts, config, directory

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import shlex
 import tarfile
@@ -56,6 +57,7 @@ class DaytonaJob:
         source_package: bytes,
         entrypoint: str,
         config: dict,
+        env_vars: dict | None = None,
     ):
         self.id = uuid.uuid4().hex
         self.status = DaytonaJobStatus.PENDING
@@ -73,6 +75,7 @@ class DaytonaJob:
         self._snapshot = snapshot
         self._source_package = source_package
         self._volume = volume
+        self._env_vars = env_vars or {}
 
     async def start(self):
         """Starts the Daytona sandbox and runs the specified job."""
@@ -126,12 +129,17 @@ class DaytonaJob:
         await self.cleanup()
         self.status = DaytonaJobStatus.CANCELED
 
-    async def cleanup(self, wait: bool = False):
+    async def cleanup(self, wait: bool = False) -> None:
         if self._sandbox is not None:
             try:
                 await self._sandbox.delete(wait=wait)
             except DaytonaNotFoundError:
                 pass
+            except Exception:
+                logger.exception("Failed to delete sandbox for job %s", self.id)
+                raise
+            self._sandbox = None
+            self._command_id = None
 
     async def _create_sandbox(self) -> AsyncSandbox:
         try:
@@ -140,6 +148,7 @@ class DaytonaJob:
                 CreateSandboxFromSnapshotParams(
                     snapshot=self._snapshot.name,
                     volumes=[VolumeMount(volume_id=self._volume.id, mount_path="/data")],
+                    env_vars=self._env_vars,
                     auto_stop_interval=0,
                     ttl_minutes=65,
                     ephemeral=True,
@@ -175,29 +184,34 @@ class DaytonaJob:
 
 
 class DaytonaRunner:
-    # TODO Handle sigterm and sigint
-
     def __init__(
         self,
         work_dir: str,
         entrypoint: str,
         resources: dict,
         volume_name: str,
-        secrets: list[str],
+        env_vars: dict | None = None,
         max_concurrent_jobs: int = 1,
         verbose: bool = False,
     ):
+        if max_concurrent_jobs < 1:
+            raise ValueError("max_concurrent_jobs must be at least 1")
         self._workdir = Path(work_dir)
         self._entrypoint = entrypoint
         self._resources = resources
         self._volume_name = volume_name
-        self._secrets = secrets
+        # TODO Use daytona secrets API instead
+        self._env_vars = env_vars or {}
         self._max_concurrent_jobs = max_concurrent_jobs
         self._verbose = verbose
 
-        self._daytona = AsyncDaytona()
         self._jobs = {}
         self._source_package = self._package_source()
+        self._daytona = AsyncDaytona()
+
+    async def close(self) -> None:
+        """Close the SDK client after all job tasks have finished cleaning up."""
+        await self._daytona.close()
 
     async def create_job(
         self,
@@ -213,6 +227,7 @@ class DaytonaRunner:
             source_package=self._source_package,
             entrypoint=self._entrypoint,
             config=config,
+            env_vars=self._env_vars,
         )
         self._jobs[job.id] = job
 
@@ -251,26 +266,36 @@ class DaytonaRunner:
                 except DaytonaSpotEvictedError:
                     logger.warning("Job %s was preempted, re-running...", job.id)
                 finally:
-                    await job.cleanup(wait=True)
+                    await job.cleanup(wait=False)
 
     async def _get_or_create_snapshot(self) -> Snapshot:
         uv_lock_path = self._workdir / "uv.lock"
         pyproject_toml_path = self._workdir / "pyproject.toml"
 
-        # TODO Is uv_lock enough for cache key?
-        key = sha256(uv_lock_path.read_bytes()).hexdigest()
+        # TODO libgl1 is hardcoded for now -- allow extra libs to be specified in config
+        image = (
+            Image.base("python:3.14-slim-bookworm")
+            .run_commands("apt-get update && apt-get install -y --no-install-recommends libgl1")
+            .pip_install_from_pyproject(str(pyproject_toml_path), optional_dependencies=[])
+        )
+        key = sha256(
+            b"\0".join(
+                [
+                    uv_lock_path.read_bytes(),
+                    pyproject_toml_path.read_bytes(),
+                    image.dockerfile().encode(),
+                    json.dumps(self._resources, sort_keys=True).encode(),
+                ]
+            )
+        ).hexdigest()
         try:
             snapshot = await self._daytona.v0.snapshot.get(key)
         except DaytonaNotFoundError:
-            # TODO Determine python version dynamically from pyproject.toml
-            # TODO Install from uv.lock and include required system packages.
             async with asyncio.timeout(1200):
                 snapshot = await self._daytona.v0.snapshot.create(
                     CreateSnapshotParams(
                         name=key,
-                        image=Image.base("python:3.14-slim-bookworm").pip_install_from_pyproject(
-                            str(pyproject_toml_path), optional_dependencies=[]
-                        ),
+                        image=image,
                         resources=Resources(**self._resources),
                     ),
                     # TODO Use verbose flag to control logging
