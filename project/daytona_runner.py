@@ -16,6 +16,7 @@ from daytona import AsyncDaytona
 from daytona.v0 import (
     AsyncSandbox,
     CreateSandboxFromSnapshotParams,
+    CreateSecretParams,
     CreateSnapshotParams,
     Image,
     Resources,
@@ -57,7 +58,7 @@ class DaytonaJob:
         source_package: bytes,
         entrypoint: str,
         config: dict,
-        env_vars: dict | None = None,
+        secrets: dict[str, str] | None = None,
     ):
         self.id = uuid.uuid4().hex
         self.status = DaytonaJobStatus.PENDING
@@ -75,7 +76,7 @@ class DaytonaJob:
         self._snapshot = snapshot
         self._source_package = source_package
         self._volume = volume
-        self._env_vars = env_vars or {}
+        self._secrets = secrets or {}
 
     async def start(self):
         """Starts the Daytona sandbox and runs the specified job."""
@@ -148,7 +149,7 @@ class DaytonaJob:
                 CreateSandboxFromSnapshotParams(
                     snapshot=self._snapshot.name,
                     volumes=[VolumeMount(volume_id=self._volume.id, mount_path="/data")],
-                    env_vars=self._env_vars,
+                    secrets=self._secrets,
                     auto_stop_interval=0,
                     ttl_minutes=65,
                     ephemeral=True,
@@ -190,7 +191,7 @@ class DaytonaRunner:
         entrypoint: str,
         resources: dict,
         volume_name: str,
-        env_vars: dict | None = None,
+        secrets: dict[str, str] | None = None,  # {"WANDB_API_KEY": "your_api_key"}
         max_concurrent_jobs: int = 1,
         verbose: bool = False,
     ):
@@ -200,14 +201,14 @@ class DaytonaRunner:
         self._entrypoint = entrypoint
         self._resources = resources
         self._volume_name = volume_name
-        # TODO Use daytona secrets API instead
-        self._env_vars = env_vars or {}
         self._max_concurrent_jobs = max_concurrent_jobs
         self._verbose = verbose
 
         self._jobs = {}
         self._source_package = self._package_source()
         self._daytona = AsyncDaytona()
+        self._secrets = secrets or {}
+        self._secret_names = None
 
     async def close(self) -> None:
         """Close the SDK client after all job tasks have finished cleaning up."""
@@ -219,6 +220,8 @@ class DaytonaRunner:
     ) -> DaytonaJob:
         snapshot = await self._get_or_create_snapshot()
         volume = await self._get_or_create_volume()
+        if self._secret_names is None:
+            self._secret_names = await self._get_or_create_secrets(self._secrets)
 
         job = DaytonaJob(
             daytona=self._daytona,
@@ -227,7 +230,7 @@ class DaytonaRunner:
             source_package=self._source_package,
             entrypoint=self._entrypoint,
             config=config,
-            env_vars=self._env_vars,
+            secrets=self._secret_names,
         )
         self._jobs[job.id] = job
 
@@ -316,6 +319,29 @@ class DaytonaRunner:
                 volume = await self._daytona.v0.volume.get(self._volume_name)
 
         return volume
+
+    async def _get_or_create_secrets(self, secrets: dict) -> dict:
+        existing_names = set()
+        secret_names = {}
+        if not secrets:
+            return secret_names
+
+        cursor = None
+        while True:
+            page = await self._daytona.v0.secret.list(cursor=cursor)
+            existing_names |= {s.name for s in page.items}
+            cursor = page.next_cursor
+            if cursor is None:
+                break
+
+        for env_name, value in secrets.items():
+            name = f"daytona-runner-{env_name}"
+            if name not in existing_names:
+                await self._daytona.v0.secret.create(CreateSecretParams(name=name, value=value))
+
+            secret_names[env_name] = name
+
+        return secret_names
 
     # TODO Perhaps parse .gitignore
     SOURCE_EXCLUDES = (

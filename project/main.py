@@ -16,7 +16,7 @@ async def main() -> None:
         entrypoint="physical_ai.main:train",
         resources={"cpu": 4, "memory": 8, "disk": 10},
         volume_name="experiment_volume",
-        env_vars={"WANDB_API_KEY": os.environ["WANDB_API_KEY"]},
+        secrets={"WANDB_API_KEY": os.environ["WANDB_API_KEY"]},
     )
     try:
         sweep = {
