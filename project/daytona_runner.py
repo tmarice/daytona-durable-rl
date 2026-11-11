@@ -67,10 +67,9 @@ class DaytonaJob:
         self._checkpoint_dir = f"{self._data_dir}/checkpoints"
         self._sandbox = None
         self._command_id = None
-
-        config = dict(config)
-        config["checkpoint_dir"] = self._checkpoint_dir
-        self._command = self._build_command(entrypoint, config)
+        self.attempt_id: str | None = None
+        self._entrypoint = entrypoint
+        self._config = dict(config)
 
         self._daytona = daytona
         self._snapshot = snapshot
@@ -81,6 +80,7 @@ class DaytonaJob:
     async def start(self):
         """Starts the Daytona sandbox and runs the specified job."""
         if self.status in (DaytonaJobStatus.PREEMPTED, DaytonaJobStatus.PENDING):
+            self.attempt_id = uuid.uuid4().hex
             self.status = DaytonaJobStatus.PREPARING
             self._sandbox = await self._create_sandbox()
             await self._upload_source_package(self._sandbox)
@@ -90,7 +90,7 @@ class DaytonaJob:
 
         await self._sandbox.process.create_session(self.id)
         response = await self._sandbox.process.execute_session_command(
-            self.id, SessionExecuteRequest(command=self._command, run_async=True)
+            self.id, SessionExecuteRequest(command=self._build_command(), run_async=True)
         )
 
         self._command_id = response.cmd_id
@@ -173,11 +173,13 @@ class DaytonaJob:
         if result.exit_code != 0:
             raise RuntimeError(f"Failed to prepare job {self.id} sandbox: {result.result}")
 
-    def _build_command(self, entrypoint: str, config: dict) -> str:
-        module, function = entrypoint.split(":", 1)
+    def _build_command(self) -> str:
+        module, function = self._entrypoint.split(":", 1)
         code = (
             "import importlib; "
-            f"getattr(importlib.import_module({module!r}), {function!r})({config!r})"
+            f"getattr(importlib.import_module({module!r}), {function!r})("
+            f"{self._config!r}, experiment_id={self.id!r}, attempt_id={self.attempt_id!r}, "
+            f"checkpoint_dir={self._checkpoint_dir!r})"
         )
         command = f"cd {shlex.quote(self._code_dir)} && " + shlex.join(["python", "-uc", code])
 
@@ -379,21 +381,3 @@ class DaytonaRunner:
                     ),
                 )
             return buffer.getvalue()
-
-
-class ExperimentSession:
-    def __init__(
-        self,
-        experiment_id: str,
-        attempt_id: str,
-        checkpoint_dir: str,
-    ):
-        self._checkpoint_dir = Path(checkpoint_dir)
-
-    def save_checkpoint(self, checkpoint_data: dict):
-        # TODO Save checkpoint data to new file in checkpoint_dir with unique name, and replace latest_checkpoint with symlink to it
-        pass
-
-    def restore_checkpoint(self) -> dict:
-        # TODO Read latest checkpoint file from checkpoint_dir and return its contents as dict, or None if no checkpoint exists
-        pass
