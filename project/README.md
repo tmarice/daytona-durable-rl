@@ -45,6 +45,12 @@ Local training does not require cloud credentials.
 Use `--gpu` for an NVIDIA GPU with CUDA support.
 Add `--video` to save a video of the policy before and after training.
 Video output requires `ffmpeg` with the `libx264` encoder.
+Videos use MuJoCo's native renderer with model meshes, materials, and lighting.
+On headless Linux, install `libosmesa6` and set `MUJOCO_GL=osmesa` before starting Python.
+The Daytona image includes these dependencies. Training still uses the GPU.
+macOS uses its native graphics backend.
+Use `MUJOCO_GL=egl` only on Linux systems with working EGL graphics support.
+The trainer checks rendering before training starts when `--video` is enabled.
 Add `--wandb` to send local results to W&B.
 Use `--help` to list all options.
 
@@ -71,7 +77,7 @@ Review the settings in [main.py](main.py) before you start:
 
 | Setting | Value |
 | --- | --- |
-| Task | `CartpoleSwingup` |
+| Task | `WalkerWalk` |
 | Jobs | Six configurations, each with seeds 11 and 22 |
 | Training steps per job | 62,914,560 |
 | Maximum active jobs | Two |
@@ -82,7 +88,10 @@ The sweep compares a baseline with five changes.
 Each change affects one setting: learning rate, entropy cost, update count, or batch size.
 Select a task with the `Task` enum in `main.py`, for example `Task.WALKER_WALK`.
 `build_training_grid(task)` returns twelve configurations with the selected task's settings.
-Cartpole tasks use the budget above. Other tasks use the presets in [tasks.py](phy_rl/tasks.py).
+All sweep settings are in `main.py`. The controller does not import the worker package.
+Walker uses 62,914,560 steps and nine evaluations. This gives 64 collection and training
+cycles, compared with eight cycles in the earlier 7,864,320-step preset.
+Other tasks have separate presets in the same function.
 
 Start the sweep:
 
@@ -194,6 +203,13 @@ uv run --no-sync python -m unittest discover -s tests -v
 
 The unit tests use simulated cloud services.
 Install the training dependencies and `ffmpeg`.
+Run the native rendering test without training:
+
+```sh
+RUN_MUJOCO_RENDER=1 uv run --project phy_rl --no-sync \
+  python -m unittest tests.test_video -v
+```
+
 Then run the CPU training and recovery tests:
 
 ```sh

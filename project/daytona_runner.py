@@ -541,12 +541,14 @@ class DaytonaRunner:
         uv_lock_path = self._workdir / "uv.lock"
         pyproject_toml_path = self._workdir / "pyproject.toml"
 
-        # TODO libgl1 is hardcoded for now -- allow extra libs to be specified in config
+        # TODO Allow workload-specific system packages to be specified in config.
         image = (
             Image.base("python:3.14-slim-bookworm")
-            .run_commands("apt-get update && apt-get install -y --no-install-recommends libgl1")
+            .run_commands(
+                "apt-get update && apt-get install -y --no-install-recommends "
+                "libgl1 libosmesa6 ffmpeg"
+            )
             .pip_install_from_requirements(str(self._workdir / "requirements.txt"))
-            .run_commands("apt-get update && apt-get install -y --no-install-recommends ffmpeg")
         )
         key = sha256(
             b"\0".join(

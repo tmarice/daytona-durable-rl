@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import main as example
 from daytona_runner import DaytonaJobResult, DaytonaJobStatus, DaytonaRunner
 from phy_rl.tasks import TASK_DEFAULTS
-from phy_rl.train import config_from_values
+from phy_rl.train import Config, config_from_values
 
 
 class TrainingGridTests(unittest.TestCase):
@@ -36,6 +36,8 @@ class TrainingGridTests(unittest.TestCase):
                     self.assertIs(type(values["task"]), str)
                     self.assertEqual(values, json.loads(json.dumps(values)))
                     config = config_from_values(values)
+                    # Every worker option is supplied by main.py, even if defaults change.
+                    self.assertEqual(set(values), set(Config.__dataclass_fields__))
                     self.assertEqual(config.task, task.value)
                     self.assertEqual(config.backend, "gpu")
                     self.assertTrue(config.video)
@@ -50,13 +52,10 @@ class TrainingGridTests(unittest.TestCase):
                         config.total_steps % (steps_per_update * (config.num_evals - 1)), 0
                     )
 
-    def test_robot_baselines_keep_task_presets_and_candidates_change_one_setting(self) -> None:
+    def test_candidates_change_one_setting(self) -> None:
         for task in example.Task:
             with self.subTest(task=task):
                 grid = example.build_training_grid(task)
-                baseline = grid[0]
-                for key, value in TASK_DEFAULTS[task.value].items():
-                    self.assertEqual(baseline[key], value)
                 for seed in (11, 22):
                     candidates = [config for config in grid if config["seed"] == seed]
                     self.assertEqual(len(candidates), 6)
@@ -70,6 +69,44 @@ class TrainingGridTests(unittest.TestCase):
                             changed,
                             {"learning_rate", "entropy_cost", "updates_per_batch", "batch_size"},
                         )
+
+    def test_walker_has_a_longer_budget_and_intermediate_evaluations(self) -> None:
+        baseline = example.build_training_grid(example.Task.WALKER_WALK)[0]
+        self.assertEqual(baseline["total_steps"], 62_914_560)
+        self.assertEqual(baseline["num_evals"], 9)
+        steps_per_update = (
+            baseline["batch_size"] * baseline["num_minibatches"] * baseline["unroll_length"]
+        )
+        self.assertEqual(baseline["total_steps"] // steps_per_update, 64)
+
+    def test_controller_runs_without_the_worker_package(self) -> None:
+        script = textwrap.dedent("""
+            import sys
+            from importlib.abc import MetaPathFinder
+
+            class BlockWorker(MetaPathFinder):
+                def find_spec(self, fullname, path=None, target=None):
+                    if fullname == "phy_rl" or fullname.startswith("phy_rl."):
+                        raise ImportError("The worker package is unavailable")
+
+            sys.meta_path.insert(0, BlockWorker())
+            import main
+            from wandb_reporter import WandbReporter
+            for task in main.Task:
+                grid = main.build_training_grid(task)
+                assert len(grid) == 12
+                reporter = WandbReporter(grid[0])
+                assert reporter.config == grid[0]
+        """)
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            check=False,
+            cwd=Path(__file__).resolve().parents[1],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class ExampleTests(unittest.IsolatedAsyncioTestCase):
@@ -123,6 +160,11 @@ class ExampleTests(unittest.IsolatedAsyncioTestCase):
             close=AsyncMock(side_effect=lambda: events.append("client closed")),
         )
         with (
+            patch.object(
+                example,
+                "build_training_grid",
+                return_value=example.build_training_grid(example.Task.CARTPOLE_SWINGUP),
+            ),
             patch.object(example, "DaytonaRunner", return_value=runner) as constructor,
             redirect_stdout(io.StringIO()) as output,
         ):
@@ -175,7 +217,7 @@ class ExampleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(constructor.call_args.kwargs["entrypoint"], "train:run")
         self.assertEqual(constructor.call_args.kwargs["resources"]["gpu"], 1)
         self.assertEqual(constructor.call_args.kwargs["max_concurrent_jobs"], 2)
-        self.assertNotIn("env_vars", constructor.call_args.kwargs)
+        self.assertEqual(constructor.call_args.kwargs["env_vars"], {"MUJOCO_GL": "osmesa"})
         self.assertNotIn("secrets", constructor.call_args.kwargs)
         for call, reporter in zip(runner.create_job.call_args_list, self.reporters, strict=True):
             self.assertIs(call.kwargs["on_poll"], reporter.poll)

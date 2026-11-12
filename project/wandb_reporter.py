@@ -14,11 +14,31 @@ from daytona.v0 import AsyncSandbox
 from daytona.v0.common.errors import DaytonaNotFoundError
 
 from daytona_runner import DaytonaJob, DaytonaJobStatus
-from phy_rl.results import write_json
-from phy_rl.tracking import RESULT_FILES, WandbTracker
-from phy_rl.train import config_from_values, training_config
 
 logger = logging.getLogger(__name__)
+
+# The worker/controller file contract. No worker modules are imported on the controller.
+RESULT_FILES = (
+    "requested_config.json",
+    "resolved_config.json",
+    "attempt.json",
+    "metrics.jsonl",
+    "metrics.csv",
+    "learning_curves.png",
+    "evaluation_before.json",
+    "evaluation_after.json",
+    "policy_comparison.png",
+    "policy_comparison.mp4",
+    "summary.json",
+    "status.json",
+    "checkpoint_status.json",
+    "video.json",
+    "error.txt",
+)
+
+
+def write_json(path: Path, value: dict) -> None:
+    path.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n", encoding="utf-8")
 
 
 class WandbReporter:
@@ -30,12 +50,14 @@ class WandbReporter:
         project: str | None = None,
         entity: str | None = None,
     ) -> None:
-        self.config = config_from_values(config)
+        self.config = dict(config)
         self.output = output
         self.project = project
         self.entity = entity
         self.run = None
-        self.tracker = None
+        self.attempt_id = None
+        self.attempt_directory = None
+        self.last_env_steps = 0
         self.directory = None
         self.processed_lines = 0
         self.evaluations = set()
@@ -59,7 +81,7 @@ class WandbReporter:
             reinit="create_new",
             mode="online",
             dir=str(self.directory.resolve()),
-            config={**training_config(self.config), "experiment_id": job.id},
+            config={**self.config, "experiment_id": job.id},
             # Automatic system metrics would describe the controller, not the GPU worker.
             settings=wandb.Settings(
                 disable_git=True,
@@ -83,24 +105,69 @@ class WandbReporter:
         )
         logger.info("Job %s | W&B: %s", job.id[:8], self.run.url)
 
-    def _attempt(self, job: DaytonaJob) -> tuple[WandbTracker, str]:
+    def _attempt(self, job: DaytonaJob) -> tuple[Path, str]:
         assert self.directory is not None and self.run is not None
         assert job.attempt_id is not None
-        if self.tracker is None or self.tracker.attempt_id != job.attempt_id:
+        if self.attempt_id != job.attempt_id:
             directory = self.directory / job.attempt_id
             directory.mkdir(parents=True, exist_ok=True)
-            self.tracker = WandbTracker(directory, attempt_id=job.attempt_id)
-            self.tracker.run = self.run
+            self.attempt_id = job.attempt_id
+            self.attempt_directory = directory
+            self.last_env_steps = 0
             self.processed_lines = 0
             self.latest_progress = None
             self.last_metric_at = 0.0
             self.last_progress_log = 0.0
             self.evaluations = set()
             self.run.summary.update({"attempt_id": job.attempt_id, "job_status": "running"})
-        output = PurePosixPath(str(self.config.output))
+        output = PurePosixPath(self.config.get("output", "runs"))
         if not output.is_absolute():
             output = PurePosixPath(f"/run/{job.id}/code") / output
-        return self.tracker, str(output / job.attempt_id)
+        assert self.attempt_directory is not None
+        return self.attempt_directory, str(output / job.attempt_id)
+
+    def _log(self, env_steps: int, values: dict) -> None:
+        self.last_env_steps = int(env_steps)
+        self.run.log({**values, "env_steps": int(env_steps), "attempt_id": self.attempt_id})
+
+    def _evaluation(self, phase: str, result: dict) -> None:
+        values = {
+            f"heldout/{phase}/{key}": result[key]
+            for key in ("mean_return", "std_return", "mean_length")
+        }
+        values.update(
+            {
+                f"heldout/{phase}/task/{name}": value
+                for name, value in result.get("task_metrics", {}).items()
+            }
+        )
+        if "balance" in result:
+            balance = result["balance"]
+            values[f"heldout/{phase}/balance_success_rate"] = (
+                balance["success_count"] / balance["episode_count"]
+            )
+        self._log(result["training_step"], values)
+
+    def _upload_results(self, directory: Path, summary: dict | None) -> None:
+        import wandb
+
+        if summary is not None:
+            self.run.summary.update(summary)
+        media = {}
+        for name in ("learning_curves.png", "policy_comparison.png"):
+            path = directory / name
+            if path.is_file():
+                media[f"plots/{path.stem}"] = wandb.Image(str(path))
+        video = directory / "policy_comparison.mp4"
+        if video.is_file():
+            media["policy/comparison"] = wandb.Video(str(video), format="mp4")
+        if media:
+            step = summary["actual_steps"] if summary is not None else self.last_env_steps
+            self._log(step, media)
+        for name in RESULT_FILES:
+            path = directory / name
+            if path.is_file():
+                self.run.save(str(path), base_path=str(directory.parent), policy="now")
 
     async def _download(self, sandbox: AsyncSandbox, path: str) -> bytes | None:
         try:
@@ -110,16 +177,16 @@ class WandbReporter:
             return None
 
     async def poll(self, job: DaytonaJob, sandbox: AsyncSandbox) -> None:
-        tracker, remote = self._attempt(job)
+        directory, remote = self._attempt(job)
         content = await self._download(sandbox, f"{remote}/metrics.jsonl")
         if content is not None:
             # A concurrent append can leave the last line incomplete. Read it next time.
             complete, separator, _ = content.rpartition(b"\n")
             lines = complete.splitlines() if separator else []
-            (tracker.directory / "metrics.jsonl").write_bytes(complete + separator)
+            (directory / "metrics.jsonl").write_bytes(complete + separator)
             for line in lines[self.processed_lines :]:
                 row = json.loads(line)
-                tracker.log(
+                self._log(
                     row["step"],
                     {
                         **row["metrics"],
@@ -151,8 +218,8 @@ class WandbReporter:
                 evaluation = json.loads(content)
             except json.JSONDecodeError:
                 continue  # The worker has not finished writing this file yet.
-            (tracker.directory / name).write_bytes(content)
-            tracker.evaluation(evaluation["training_step"], phase, evaluation)
+            (directory / name).write_bytes(content)
+            self._evaluation(phase, evaluation)
             self.evaluations.add(phase)
             logger.info(
                 "Job %s | held-out %s return=%.2f",
@@ -174,8 +241,8 @@ class WandbReporter:
             "Job %s | training steps=%s/%s (%.1f%%) | last new metric %.0fs ago",
             job.id[:8],
             f"{step:,}",
-            f"{self.config.total_steps:,}",
-            100 * step / self.config.total_steps,
+            f"{self.config['total_steps']:,}",
+            100 * step / self.config["total_steps"],
             now - self.last_metric_at,
         )
 
@@ -184,7 +251,7 @@ class WandbReporter:
         logger.warning("%s: %s", message, error)
 
     async def collect(self, job: DaytonaJob, sandbox: AsyncSandbox) -> None:
-        tracker, remote = self._attempt(job)
+        directory, remote = self._attempt(job)
         try:
             await self.poll(job, sandbox)
         except Exception as error:
@@ -192,19 +259,17 @@ class WandbReporter:
 
         # Download before sandbox deletion; upload only our explicit result files.
         for name in RESULT_FILES:
-            if name == "wandb.json":
-                continue  # W&B runs on the controller.
             try:
                 content = await self._download(sandbox, f"{remote}/{name}")
                 if content is not None:
-                    (tracker.directory / name).write_bytes(content)
+                    (directory / name).write_bytes(content)
             except Exception as error:
                 self._error(f"Could not download {name}", error)
                 if job.status == DaytonaJobStatus.PREEMPTED:
                     break  # An evicted sandbox's local files may already be gone.
 
         write_json(
-            tracker.directory / "collection.json",
+            directory / "collection.json",
             {
                 "attempt_id": job.attempt_id,
                 "status": job.status,
@@ -218,16 +283,16 @@ class WandbReporter:
                     "attempt_status": str(job.status).lower(),
                 }
             )
-            resolved = tracker.directory / "resolved_config.json"
+            resolved = directory / "resolved_config.json"
             if resolved.is_file():
                 self.run.config.update(
                     {"worker": json.loads(resolved.read_text())},
                     allow_val_change=True,
                 )
-            summary_path = tracker.directory / "summary.json"
+            summary_path = directory / "summary.json"
             summary = json.loads(summary_path.read_text()) if summary_path.exists() else None
             logger.info("Job %s | submitting results and available media to W&B", job.id[:8])
-            await asyncio.to_thread(tracker.upload_results, summary)
+            await asyncio.to_thread(self._upload_results, directory, summary)
         except Exception as error:
             self._error("W&B result upload failed; local files were retained", error)
 

@@ -73,6 +73,9 @@ class ReporterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(options["reinit"], "create_new")
         self.assertEqual(options["mode"], "online")
         self.assertEqual(options["config"]["experiment_id"], "job")
+        self.assertEqual(
+            options["config"], {"wandb": False, "total_steps": 128, "experiment_id": "job"}
+        )
         self.assertTrue(self.sdk.Settings.call_args.kwargs["x_disable_stats"])
         self.run.define_metric.assert_any_call("*", step_metric="env_steps")
         self.assertEqual(
@@ -176,6 +179,8 @@ class ReporterTests(unittest.IsolatedAsyncioTestCase):
                         "mean_return": 2,
                         "std_return": 1,
                         "mean_length": 32,
+                        "task_metrics": {"forward_speed_m_per_s": 0.5},
+                        "balance": {"success_count": 1, "episode_count": 2},
                     }
                 ).encode(),
             )
@@ -183,6 +188,26 @@ class ReporterTests(unittest.IsolatedAsyncioTestCase):
         await self.reporter.poll(self.job, self.sandbox)
         self.assertEqual([c.args[0]["env_steps"] for c in self.run.log.call_args_list], [0, 128])
         self.assertIn("heldout/after/mean_return", self.run.log.call_args.args[0])
+        self.assertEqual(
+            self.run.log.call_args.args[0]["heldout/after/task/forward_speed_m_per_s"], 0.5
+        )
+        self.assertEqual(self.run.log.call_args.args[0]["heldout/after/balance_success_rate"], 0.5)
+
+    async def test_collection_uploads_media_at_last_known_step_without_a_summary(self) -> None:
+        self.put("metrics.jsonl", metric(64))
+        self.put("policy_comparison.mp4", b"video")
+        self.put("policy_comparison.png", b"image")
+        await self.reporter.collect(self.job, self.sandbox)
+        directory = self.root / "job/first"
+        self.sdk.Video.assert_called_once_with(
+            str(directory / "policy_comparison.mp4"), format="mp4"
+        )
+        self.sdk.Image.assert_called_once_with(str(directory / "policy_comparison.png"))
+        media = self.run.log.call_args.args[0]
+        self.assertEqual(media["env_steps"], 64)
+        self.assertEqual(media["attempt_id"], "first")
+        self.assertIs(media["policy/comparison"], self.sdk.Video.return_value)
+        self.assertIs(media["plots/policy_comparison"], self.sdk.Image.return_value)
 
     async def test_final_collection_drains_metrics_and_downloads_only_result_files(self) -> None:
         self.put("metrics.jsonl", metric(64))

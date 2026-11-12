@@ -90,6 +90,8 @@ second = run(dataclasses.replace(parse_args(["--resume", str(checkpoint)]), vide
             self.assertGreater(resumed["policy_parameter_change_l2"], 0)
             for name in ("policy_comparison.mp4", "policy_comparison.png", "learning_curves.png"):
                 self.assertGreater((first / name).stat().st_size, 1000)
+            video = json.loads((first / "video.json").read_text())
+            self.assertEqual(video["renderer"], "mujoco_native")
             if task == "Go1JoystickFlatTerrain":
                 self.assertEqual(resolved["network"]["value_obs_key"], "privileged_state")
 

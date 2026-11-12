@@ -29,6 +29,7 @@ if __package__:
     from .results import Metrics, create_run_directory, write_json
     from .tasks import TASK_DEFAULTS, network_settings, prepare_robot_assets
     from .tracking import WandbTracker
+    from .video import check_rendering, configure_rendering, write_comparison
 else:
     # Daytona uploads the contents of phy_rl and imports this module as `train`.
     from checkpointing import checkpoint_from_data, read_checkpoint, save_state
@@ -41,6 +42,7 @@ else:
     from results import Metrics, create_run_directory, write_json
     from tasks import TASK_DEFAULTS, network_settings, prepare_robot_assets
     from tracking import WandbTracker
+    from video import check_rendering, configure_rendering, write_comparison
 
 
 @dataclass(frozen=True)
@@ -311,6 +313,8 @@ def train(
     if data is not None:
         assert session.latest_checkpoint is not None
         checkpoint = checkpoint_from_data(session.latest_checkpoint, data)
+    if config.video:
+        configure_rendering()
     jax = initialize_jax(config.backend)
     os.environ.setdefault("MPLCONFIGDIR", str(directory / ".matplotlib"))
     from brax.training.agents.ppo import networks as ppo_networks
@@ -328,6 +332,8 @@ def train(
     prepare_robot_assets(config.task, directory)
     env = registry.load(config.task, config=env_config)
     eval_env = registry.load(config.task, config=env_config)
+    if config.video:
+        check_rendering(eval_env, config.task)
     settings = ppo_settings(config)
     architecture = network_settings(config.task)
     versions = {
@@ -524,11 +530,6 @@ def train(
         "latest_checkpoint": latest_checkpoint,
     }
     if config.video:
-        if __package__:
-            from .video import write_comparison
-        else:
-            from video import write_comparison
-
         summary["video"] = write_comparison(
             eval_env, initial_rollouts, final_rollouts, config, directory
         )

@@ -10,7 +10,6 @@ from enum import StrEnum
 from dotenv import load_dotenv
 
 from daytona_runner import DaytonaJobStatus, DaytonaRunner
-from phy_rl.train import config_from_values, config_values
 from wandb_reporter import WandbReporter
 
 logger = logging.getLogger(__name__)
@@ -27,20 +26,67 @@ class Task(StrEnum):
 
 def build_training_grid(task: Task) -> list[dict]:
     """Compare a task's baseline with five single-setting changes across two seeds."""
-    baseline = config_values(
-        config_from_values({"task": task.value, "backend": "gpu", "video": True, "wandb": False})
-    )
-    if task in (Task.CARTPOLE_BALANCE, Task.CARTPOLE_SWINGUP):
-        baseline.update(
-            total_steps=62_914_560,
-            num_envs=2048,
-            batch_size=1024,
-            num_minibatches=32,
-            updates_per_batch=16,
-            unroll_length=30,
-            num_evals=9,
-            episode_length=2000,
-        )
+    # All sweep settings are explicit here; the controller does not import worker code.
+    baseline = {
+        "task": task.value,
+        "total_steps": 62_914_560,
+        "num_envs": 2048,
+        "episode_length": 1000,
+        "learning_rate": 0.001,
+        "entropy_cost": 0.01,
+        "reward_scaling": 10.0,
+        "discounting": 0.995,
+        "unroll_length": 30,
+        "batch_size": 1024,
+        "num_minibatches": 32,
+        "updates_per_batch": 16,
+        "num_evals": 2,
+        "eval_episodes": 8,
+        "checkpoint_interval_steps": 4,
+        "checkpoints": True,
+        "backend": "gpu",
+        "video": True,
+        "output": "runs",
+        "resume": None,
+        "wandb": False,
+        "wandb_project": None,
+        "wandb_entity": None,
+        "wandb_mode": None,
+    }
+    cartpole = {
+        "episode_length": 2000,
+        "num_evals": 9,
+        "eval_episodes": 32,
+        "checkpoint_interval_steps": 1,
+    }
+    presets = {
+        Task.CARTPOLE_BALANCE: cartpole,
+        Task.CARTPOLE_SWINGUP: cartpole,
+        Task.CHEETAH_RUN: {"total_steps": 15_728_640},
+        # 64 collection/training cycles, with evaluation every eight cycles.
+        Task.WALKER_WALK: {"total_steps": 62_914_560, "num_evals": 9},
+        Task.GO1_JOYSTICK_FLAT_TERRAIN: {
+            "total_steps": 16_384_000,
+            "num_envs": 8192,
+            "learning_rate": 0.0003,
+            "reward_scaling": 1.0,
+            "discounting": 0.97,
+            "batch_size": 256,
+            "unroll_length": 20,
+            "updates_per_batch": 4,
+        },
+        Task.PANDA_PICK_CUBE: {
+            "total_steps": 8_192_000,
+            "episode_length": 150,
+            "reward_scaling": 1.0,
+            "discounting": 0.97,
+            "entropy_cost": 0.02,
+            "batch_size": 512,
+            "unroll_length": 10,
+            "updates_per_batch": 8,
+        },
+    }
+    baseline.update(presets[task])
 
     batch_size = baseline["batch_size"] // 2
     learning_rate = 0.0003
@@ -81,6 +127,7 @@ async def main() -> None:
         resources={"cpu": 4, "memory": 8, "disk": 20, "gpu": 1, "gpu_type": "H100"},
         volume_name="experiment_volume",
         max_concurrent_jobs=concurrency,
+        env_vars={"MUJOCO_GL": "osmesa"},
     )
     jobs = []
     reporters = {}
