@@ -274,7 +274,8 @@ def ppo_settings(config: Config) -> dict:
 
 def initialize_jax(backend: str):
     """Select the requested platform before any training dependencies initialize JAX."""
-    platform_name = "cuda" if backend == "gpu" else "cpu"
+    # CUDA remains mandatory and the default; progress callbacks also need a CPU device.
+    platform_name = "cuda,cpu" if backend == "gpu" else "cpu"
     os.environ["JAX_PLATFORMS"] = platform_name
     import jax
 
@@ -488,7 +489,9 @@ def train(
     )
     if initial_evaluation is None:
         raise RuntimeError("Trainer did not expose its initial policy for baseline evaluation")
+    actual_steps = max((row["step"] for row in metrics.rows), default=starting_step)
     final_evaluation, final_rollouts = evaluate_policy(eval_env, make_policy, params, config)
+    final_evaluation["training_step"] = actual_steps
     write_json(directory / "evaluation_after.json", final_evaluation)
     squared_changes = jax.tree_util.tree_map(
         lambda before, after: ((after - before) ** 2).sum(), initial_policy_params, params[1]
@@ -496,7 +499,6 @@ def train(
     policy_change = math.sqrt(
         sum(float(value) for value in jax.tree_util.tree_leaves(squared_changes))
     )
-    actual_steps = max((row["step"] for row in metrics.rows), default=starting_step)
     if tracker is not None:
         tracker.evaluation(actual_steps, "after", final_evaluation)
     if not math.isfinite(policy_change) or (actual_steps > starting_step and policy_change == 0):

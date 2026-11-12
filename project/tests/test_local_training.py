@@ -81,7 +81,7 @@ class ConfigurationTests(unittest.TestCase):
 
 class BackendTests(unittest.TestCase):
     def test_selection_overrides_environment_and_previously_imported_jax_configuration(self):
-        for backend, expected_platform in (("cpu", "cpu"), ("gpu", "cuda")):
+        for backend, expected_platform in (("cpu", "cpu"), ("gpu", "cuda,cpu")):
             with self.subTest(backend=backend):
                 jax = SimpleNamespace(
                     config=mock.Mock(), default_backend=mock.Mock(return_value=backend)

@@ -11,6 +11,25 @@ if __package__:
 else:
     from results import write_json
 
+RESULT_FILES = (
+    "requested_config.json",
+    "resolved_config.json",
+    "attempt.json",
+    "wandb.json",
+    "metrics.jsonl",
+    "metrics.csv",
+    "learning_curves.png",
+    "evaluation_before.json",
+    "evaluation_after.json",
+    "policy_comparison.png",
+    "policy_comparison.mp4",
+    "summary.json",
+    "status.json",
+    "checkpoint_status.json",
+    "video.json",
+    "error.txt",
+)
+
 
 class WandbTracker:
     def __init__(self, directory: Path, *, attempt_id: str) -> None:
@@ -100,48 +119,36 @@ class WandbTracker:
             )
         self.log(env_steps, values)
 
-    def finish(self, status: str, summary: dict | None = None) -> None:
+    def upload_results(self, summary: dict | None = None) -> None:
+        """Upload this attempt's files without finishing a run shared across attempts."""
         if self.run is None:
             return
         import wandb
 
+        if summary is not None:
+            self.run.summary.update(summary)
+        media = {}
+        for name in ("learning_curves.png", "policy_comparison.png"):
+            path = self.directory / name
+            if path.is_file():
+                media[f"plots/{path.stem}"] = wandb.Image(str(path))
+        if (self.directory / "policy_comparison.mp4").is_file():
+            media["policy/comparison"] = wandb.Video(
+                str(self.directory / "policy_comparison.mp4"), format="mp4"
+            )
+        if media:
+            step = summary["actual_steps"] if summary is not None else self._last_env_steps
+            self.log(step, media)
+        for name in RESULT_FILES:
+            path = self.directory / name
+            if path.is_file():
+                self.run.save(str(path), base_path=str(self.directory.parent), policy="now")
+
+    def finish(self, status: str, summary: dict | None = None) -> None:
+        if self.run is None:
+            return
         try:
             self.run.summary.update({"attempt_status": status, "attempt_id": self.attempt_id})
-            if summary is not None:
-                self.run.summary.update(summary)
-            media = {}
-            for name in ("learning_curves.png", "policy_comparison.png"):
-                path = self.directory / name
-                if path.is_file():
-                    media[f"plots/{path.stem}"] = wandb.Image(str(path))
-            if (self.directory / "policy_comparison.mp4").is_file():
-                media["policy/comparison"] = wandb.Video(
-                    str(self.directory / "policy_comparison.mp4"), format="mp4"
-                )
-            if media:
-                step = summary["actual_steps"] if summary is not None else self._last_env_steps
-                self.log(step, media)
-            # Attempt subdirectories keep earlier attempts' files intact on resume.
-            for name in (
-                "requested_config.json",
-                "resolved_config.json",
-                "attempt.json",
-                "wandb.json",
-                "metrics.jsonl",
-                "metrics.csv",
-                "learning_curves.png",
-                "evaluation_before.json",
-                "evaluation_after.json",
-                "policy_comparison.png",
-                "policy_comparison.mp4",
-                "summary.json",
-                "status.json",
-                "checkpoint_status.json",
-                "video.json",
-                "error.txt",
-            ):
-                path = self.directory / name
-                if path.is_file():
-                    self.run.save(str(path), base_path=str(self.directory.parent), policy="now")
+            self.upload_results(summary)
         finally:
             self.run.finish(exit_code={"completed": 0, "interrupted": 130}.get(status, 1))

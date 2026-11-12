@@ -286,6 +286,7 @@ class RealTrainingTests(unittest.TestCase):
             resolved = json.loads((directory / "resolved_config.json").read_text())
             self.assertEqual(resolved["backend"], "cpu")
             self.assertGreaterEqual(summary["actual_steps"], 1024)
+            self.assertEqual(summary["evaluation_after"]["training_step"], summary["actual_steps"])
             self.assertGreater(summary["policy_parameter_change_l2"], 0)
             self.assertEqual(len(summary["evaluation_after"]["episode_returns"]), 2)
             self.assertEqual(summary["evaluation_after"]["balance"]["episode_count"], 2)
