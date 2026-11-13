@@ -6,10 +6,13 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from aiohttp import ClientConnectionError, ClientPayloadError
+from daytona.v0 import CreateSandboxFromSnapshotParams
 from daytona.v0.common.errors import (
+    DaytonaConflictError,
     DaytonaConnectionError,
     DaytonaConnectionTimeoutError,
     DaytonaError,
+    DaytonaNotFoundError,
     DaytonaSpotEvictedError,
     DaytonaTimeoutError,
 )
@@ -141,6 +144,58 @@ class DaytonaAPITests(unittest.IsolatedAsyncioTestCase):
                 request.assert_awaited_once()
                 sleep.assert_not_awaited()
 
+    async def test_deletion_retries_state_transition_conflict(self) -> None:
+        sandbox = SimpleNamespace(
+            delete=AsyncMock(
+                side_effect=[
+                    DaytonaConflictError(
+                        "Failed to remove sandbox: Sandbox state change in progress",
+                        status_code=409,
+                    ),
+                    None,
+                ]
+            )
+        )
+        with (
+            patch("daytona_runner.asyncio.sleep", new_callable=AsyncMock) as sleep,
+            self.assertLogs("daytona_runner", level="WARNING"),
+        ):
+            await self.api.delete_sandbox(sandbox)
+        self.assertEqual(sandbox.delete.await_count, 2)
+        self.assertTrue(all(c.kwargs == {"wait": False} for c in sandbox.delete.await_args_list))
+        sleep.assert_awaited_once_with(5)
+
+    async def test_unrelated_conflicts_are_not_retried(self) -> None:
+        for name, message in (
+            ("sandbox.delete", "different conflict"),
+            ("sandbox.create", "Sandbox state change in progress"),
+        ):
+            with self.subTest(name=name, message=message):
+                error = DaytonaConflictError(message, status_code=409)
+                request = AsyncMock(side_effect=error)
+                with (
+                    patch("daytona_runner.asyncio.sleep", new_callable=AsyncMock) as sleep,
+                    self.assertRaises(DaytonaConflictError) as caught,
+                ):
+                    await self.api._request(name, request)
+                self.assertIs(caught.exception, error)
+                request.assert_awaited_once()
+                sleep.assert_not_awaited()
+
+    async def test_deletion_conflicts_respect_retry_budget(self) -> None:
+        api = DaytonaAPI(max_retries=2)
+        error = DaytonaConflictError("Sandbox state change in progress", status_code=409)
+        sandbox = SimpleNamespace(delete=AsyncMock(side_effect=error))
+        with (
+            patch("daytona_runner.asyncio.sleep", new_callable=AsyncMock) as sleep,
+            self.assertLogs("daytona_runner", level="WARNING"),
+            self.assertRaises(DaytonaConflictError) as caught,
+        ):
+            await api.delete_sandbox(sandbox)
+        self.assertIs(caught.exception, error)
+        self.assertEqual(sandbox.delete.await_count, 3)
+        self.assertEqual([c.args[0] for c in sleep.await_args_list], [5, 10])
+
     async def test_nonzero_command_exit_code_is_not_an_api_failure(self) -> None:
         response = SimpleNamespace(exit_code=7, result="training failed")
         sandbox = SimpleNamespace(process=SimpleNamespace(exec=AsyncMock(return_value=response)))
@@ -148,6 +203,143 @@ class DaytonaAPITests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(await self.api.exec(sandbox, "command", timeout=60), response)
         sandbox.process.exec.assert_awaited_once_with("command", timeout=60)
         sleep.assert_not_awaited()
+
+    async def test_creation_timeout_reuses_sandbox_by_id_or_name(self) -> None:
+        params = CreateSandboxFromSnapshotParams(name="attempt-name", snapshot="gpu")
+        for sandbox_id in (None, "allocated-id"):
+            with self.subTest(sandbox_id=sandbox_id):
+                error = DaytonaTimeoutError("creation timed out")
+                error.sandbox_id = sandbox_id
+                sandbox = SimpleNamespace(wait_for_sandbox_start=AsyncMock())
+                self.client.v0.create = AsyncMock(side_effect=error)
+                self.client.v0.get = AsyncMock(return_value=sandbox)
+                with (
+                    patch("daytona_runner.asyncio.sleep", new_callable=AsyncMock) as sleep,
+                    self.assertLogs("daytona_runner", level="WARNING"),
+                ):
+                    self.assertIs(await self.api.create_sandbox(params), sandbox)
+                self.client.v0.create.assert_awaited_once_with(params)
+                self.client.v0.get.assert_awaited_once_with(sandbox_id or params.name)
+                sandbox.wait_for_sandbox_start.assert_awaited_once_with(timeout=60)
+                sleep.assert_awaited_once_with(5)
+
+    async def test_creation_timeout_without_allocation_retries_same_name(self) -> None:
+        params = CreateSandboxFromSnapshotParams(name="attempt-name", snapshot="gpu")
+        sandbox = object()
+        self.client.v0.create = AsyncMock(
+            side_effect=[DaytonaTimeoutError("creation timed out"), sandbox]
+        )
+        self.client.v0.get.side_effect = DaytonaNotFoundError("not allocated")
+        with (
+            patch("daytona_runner.asyncio.sleep", new_callable=AsyncMock),
+            self.assertLogs("daytona_runner", level="WARNING"),
+        ):
+            self.assertIs(await self.api.create_sandbox(params), sandbox)
+        self.client.v0.get.assert_awaited_once_with(params.name)
+        calls = self.client.v0.create.await_args_list
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0], calls[1])
+
+    async def test_repeated_start_timeouts_exhaust_budget_without_duplicate_creation(self) -> None:
+        params = CreateSandboxFromSnapshotParams(name="attempt-name", snapshot="gpu")
+        error = DaytonaTimeoutError("start timed out")
+        sandbox = SimpleNamespace(wait_for_sandbox_start=AsyncMock(side_effect=error))
+        self.api._max_retries = 2
+        self.client.v0.create = AsyncMock(side_effect=error)
+        self.client.v0.get.return_value = sandbox
+        with (
+            patch("daytona_runner.asyncio.sleep", new_callable=AsyncMock) as sleep,
+            self.assertLogs("daytona_runner", level="WARNING"),
+            self.assertRaises(DaytonaTimeoutError),
+        ):
+            await self.api.create_sandbox(params)
+        self.client.v0.create.assert_awaited_once_with(params)
+        self.assertEqual(sandbox.wait_for_sandbox_start.await_count, 2)
+        self.assertEqual([call.args[0] for call in sleep.await_args_list], [5, 10])
+
+    async def test_creation_lookup_failure_does_not_blindly_create_again(self) -> None:
+        params = CreateSandboxFromSnapshotParams(name="attempt-name", snapshot="gpu")
+        error = DaytonaError("denied", status_code=403)
+        self.client.v0.create = AsyncMock(side_effect=DaytonaTimeoutError("creation timed out"))
+        self.client.v0.get.side_effect = error
+        with (
+            patch("daytona_runner.asyncio.sleep", new_callable=AsyncMock),
+            self.assertLogs("daytona_runner", level="WARNING"),
+            self.assertRaises(DaytonaError) as caught,
+        ):
+            await self.api.create_sandbox(params)
+        self.assertIs(caught.exception, error)
+        self.client.v0.create.assert_awaited_once_with(params)
+
+    async def test_delayed_creation_is_reused_after_conflict(self) -> None:
+        params = CreateSandboxFromSnapshotParams(name="attempt-name", snapshot="gpu")
+        for sandbox_id in (None, "allocated-id"):
+            with self.subTest(sandbox_id=sandbox_id):
+                timeout = DaytonaTimeoutError("creation timed out")
+                timeout.sandbox_id = sandbox_id
+                sandbox = SimpleNamespace(wait_for_sandbox_start=AsyncMock())
+                self.client.v0.create = AsyncMock(
+                    side_effect=[timeout, DaytonaConflictError("name exists")]
+                )
+                self.client.v0.get = AsyncMock(
+                    side_effect=[DaytonaNotFoundError("not visible"), sandbox]
+                )
+                with (
+                    patch("daytona_runner.asyncio.sleep", new_callable=AsyncMock),
+                    self.assertLogs("daytona_runner", level="WARNING"),
+                ):
+                    self.assertIs(await self.api.create_sandbox(params), sandbox)
+                self.assertEqual(self.client.v0.create.await_count, 2)
+                self.assertEqual(
+                    [call.args[0] for call in self.client.v0.get.await_args_list],
+                    [sandbox_id or params.name, params.name],
+                )
+                sandbox.wait_for_sandbox_start.assert_awaited_once_with(timeout=60)
+
+    async def test_creation_conflict_without_timeout_is_not_adopted(self) -> None:
+        params = CreateSandboxFromSnapshotParams(name="attempt-name", snapshot="gpu")
+        conflict = DaytonaConflictError("name exists")
+        self.client.v0.create = AsyncMock(side_effect=conflict)
+        with self.assertRaises(DaytonaConflictError) as caught:
+            await self.api.create_sandbox(params)
+        self.assertIs(caught.exception, conflict)
+        self.client.v0.create.assert_awaited_once_with(params)
+        self.client.v0.get.assert_not_awaited()
+
+    async def test_missing_sandbox_after_conflict_is_not_blindly_recreated(self) -> None:
+        params = CreateSandboxFromSnapshotParams(name="attempt-name", snapshot="gpu")
+        self.client.v0.create = AsyncMock(
+            side_effect=[
+                DaytonaTimeoutError("creation timed out"),
+                DaytonaConflictError("conflict"),
+            ]
+        )
+        self.client.v0.get.side_effect = DaytonaNotFoundError("not found")
+        with (
+            patch("daytona_runner.asyncio.sleep", new_callable=AsyncMock),
+            self.assertLogs("daytona_runner", level="WARNING"),
+            self.assertRaises(DaytonaNotFoundError),
+        ):
+            await self.api.create_sandbox(params)
+        self.assertEqual(self.client.v0.create.await_count, 2)
+
+    async def test_wait_timeout_after_conflict_still_uses_retry_budget(self) -> None:
+        params = CreateSandboxFromSnapshotParams(name="attempt-name", snapshot="gpu")
+        timeout = DaytonaTimeoutError("creation timed out")
+        sandbox = SimpleNamespace(wait_for_sandbox_start=AsyncMock(side_effect=[timeout, None]))
+        self.api._max_retries = 2
+        self.client.v0.create = AsyncMock(
+            side_effect=[timeout, DaytonaConflictError("name exists")]
+        )
+        self.client.v0.get.side_effect = [DaytonaNotFoundError("not visible"), sandbox, sandbox]
+        with (
+            patch("daytona_runner.asyncio.sleep", new_callable=AsyncMock) as sleep,
+            self.assertLogs("daytona_runner", level="WARNING"),
+        ):
+            self.assertIs(await self.api.create_sandbox(params), sandbox)
+        self.assertEqual(self.client.v0.create.await_count, 2)
+        self.assertEqual(sandbox.wait_for_sandbox_start.await_count, 2)
+        self.assertEqual([call.args[0] for call in sleep.await_args_list], [5, 10])
 
     async def test_cancellation_during_backoff_stops_further_requests(self) -> None:
         sleeping = asyncio.Event()

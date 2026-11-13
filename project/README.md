@@ -172,6 +172,14 @@ The controller also saves collection errors and reporting errors locally.
 A sudden sandbox loss can remove files before the controller downloads them.
 Metrics from earlier successful reads remain on your computer.
 
+Checkpoints reference a sibling `baseline-*.msgpack` file containing the original
+evaluation, trajectories, and policy parameters. Keep that file when copying checkpoints.
+Retries reuse it for the before/after summary and video, including retries after training
+has reached its target. `policy_parameter_change_l2` measures change from this baseline;
+`attempt_policy_parameter_change_l2` measures only the current attempt's updates.
+Older checkpoints without a baseline remain resumable, but emit a warning and label
+their comparison with the restored step instead of presenting it as the original policy.
+
 ## Verified behavior and limits
 
 Local `CartpoleBalance` training kept the pole balanced for 20 seconds in all

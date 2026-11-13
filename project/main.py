@@ -117,14 +117,14 @@ async def main() -> None:
     )
     for name in (__name__, "daytona_runner", "wandb_reporter"):
         logging.getLogger(name).setLevel(logging.INFO)
-    concurrency = 2
-    task = Task.WALKER_WALK
+    concurrency = 4
+    task = Task.PANDA_PICK_CUBE
     training_grid = build_training_grid(task)
     os.environ.setdefault("WANDB_RUN_GROUP", f"{task}-{datetime.now(UTC):%Y%m%dT%H%M%SZ}")
     runner = DaytonaRunner(
         work_dir="phy_rl",
         entrypoint="train:run",
-        resources={"cpu": 4, "memory": 8, "disk": 20, "gpu": 1, "gpu_type": "H100"},
+        resources={"cpu": 4, "memory": 16, "disk": 20, "gpu": 1, "gpu_type": "H100"},
         volume_name="experiment_volume",
         max_concurrent_jobs=concurrency,
         env_vars={"MUJOCO_GL": "osmesa"},

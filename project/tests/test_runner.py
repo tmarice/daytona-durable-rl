@@ -294,6 +294,24 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertNoLogs(runner_module.logger, level="ERROR"):
             await job.run_attempt()
 
+    async def test_sandbox_disappearing_after_deletion_conflict_finishes_cleanup(self) -> None:
+        sandbox = self.make_sandbox()
+        sandbox.delete.side_effect = [
+            runner_module.DaytonaConflictError("Sandbox state change in progress", status_code=409),
+            runner_module.DaytonaNotFoundError("already deleted"),
+        ]
+        job = self.make_job(sandbox)
+        job._api._max_retries = 2
+        with (
+            patch("daytona_runner.asyncio.sleep", new_callable=AsyncMock) as sleep,
+            self.assertLogs(runner_module.logger, level="WARNING") as logs,
+        ):
+            result = await job.run_attempt()
+        self.assertEqual(result.status, runner_module.DaytonaJobStatus.COMPLETED)
+        self.assertEqual(sandbox.delete.await_count, 2)
+        sleep.assert_awaited_once_with(5)
+        self.assertEqual([record.levelname for record in logs.records], ["WARNING"])
+
     async def test_stop_during_process_requests_is_preemption(self) -> None:
         for method in ("get_session_command", "get_session_command_logs"):
             with self.subTest(method=method):
@@ -312,6 +330,78 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(job.status, runner_module.DaytonaJobStatus.PREEMPTED)
                 self.assertEqual(sandbox.refresh_data.await_count, 2)
                 sandbox.delete.assert_awaited_once_with(wait=False)
+
+    async def test_startup_sandbox_loss_retries_and_collects_as_preempted(self) -> None:
+        for phase in ("upload", "session", "launch"):
+            for cause in ("evicted", "missing"):
+                with self.subTest(phase=phase, cause=cause):
+                    lost, replacement = self.make_sandbox(), self.make_sandbox()
+                    job = self.make_job(lost)
+                    job._create_sandbox.side_effect = [lost, replacement]
+                    operation = {
+                        "upload": job._upload_source_package,
+                        "session": lost.process.create_session,
+                        "launch": lost.process.execute_session_command,
+                    }[phase]
+
+                    async def disappear(
+                        *args: object,
+                        cause: str = cause,
+                        lost: SimpleNamespace = lost,
+                        operation: AsyncMock = operation,
+                    ) -> None:
+                        if cause == "missing":
+                            lost.refresh_data.side_effect = runner_module.DaytonaNotFoundError(
+                                "gone"
+                            )
+                        else:
+                            lost.spot_evicted_at = "2026-11-12T18:30:22Z"
+                        operation.side_effect = None
+                        raise runner_module.DaytonaError("404: SANDBOX_NOT_FOUND")
+
+                    operation.side_effect = disappear
+                    statuses = []
+
+                    async def collect(
+                        current: runner_module.DaytonaJob,
+                        sandbox: object,
+                        statuses: list[runner_module.DaytonaJobStatus] = statuses,
+                    ) -> None:
+                        statuses.append(current.status)
+
+                    job._on_attempt_end = collect
+                    with self.assertLogs(runner_module.logger, level="WARNING"):
+                        result = await self.runner._run_job(job, asyncio.Semaphore(1))
+                    self.assertEqual(result.status, runner_module.DaytonaJobStatus.COMPLETED)
+                    self.assertEqual(
+                        statuses,
+                        [
+                            runner_module.DaytonaJobStatus.PREEMPTED,
+                            runner_module.DaytonaJobStatus.COMPLETED,
+                        ],
+                    )
+                    lost.delete.assert_awaited_once_with(wait=False)
+                    replacement.delete.assert_awaited_once_with(wait=False)
+
+    async def test_startup_404_on_live_sandbox_stays_fatal(self) -> None:
+        for phase in ("upload", "session", "launch"):
+            with self.subTest(phase=phase):
+                sandbox = self.make_sandbox()
+                job = self.make_job(sandbox)
+                operation = {
+                    "upload": job._upload_source_package,
+                    "session": sandbox.process.create_session,
+                    "launch": sandbox.process.execute_session_command,
+                }[phase]
+                error = runner_module.DaytonaNotFoundError("missing resource")
+                operation.side_effect = error
+                with (
+                    self.assertLogs(runner_module.logger, level="ERROR"),
+                    self.assertRaises(runner_module.DaytonaNotFoundError) as caught,
+                ):
+                    await job.run_attempt()
+                self.assertIs(caught.exception, error)
+                self.assertEqual(job.status, runner_module.DaytonaJobStatus.FAILED)
 
     async def test_process_errors_in_running_sandbox_are_not_preemption(self) -> None:
         for method in ("get_session_command", "get_session_command_logs"):

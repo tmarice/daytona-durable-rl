@@ -19,7 +19,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 if __package__:
-    from .checkpointing import checkpoint_from_data, read_checkpoint, save_state
+    from .checkpointing import (
+        checkpoint_from_data,
+        load_baseline,
+        read_checkpoint,
+        save_baseline,
+        save_state,
+    )
     from .daytona_experiment_session import (
         ExperimentSession,
         latest_checkpoint_path,
@@ -32,7 +38,13 @@ if __package__:
     from .video import check_rendering, configure_rendering, write_comparison
 else:
     # Daytona uploads the contents of phy_rl and imports this module as `train`.
-    from checkpointing import checkpoint_from_data, read_checkpoint, save_state
+    from checkpointing import (
+        checkpoint_from_data,
+        load_baseline,
+        read_checkpoint,
+        save_baseline,
+        save_state,
+    )
     from daytona_experiment_session import (
         ExperimentSession,
         latest_checkpoint_path,
@@ -318,6 +330,7 @@ def train(
     jax = initialize_jax(config.backend)
     os.environ.setdefault("MPLCONFIGDIR", str(directory / ".matplotlib"))
     from brax.training.agents.ppo import networks as ppo_networks
+    from flax import serialization
     from mujoco_playground import registry, wrapper
 
     if __package__:
@@ -430,34 +443,58 @@ def train(
         print(
             f"Starting at {starting_step:,} environment steps; checkpointing disabled.", flush=True
         )
+    baseline = load_baseline(checkpoint) if checkpoint is not None else None
+    if checkpoint is not None and baseline is None:
+        print(
+            "Warning: checkpoint has no original baseline; "
+            f"comparison starts at restored step {starting_step:,}.",
+            flush=True,
+        )
     initial_evaluation = None
     initial_policy_params = None
     initial_rollouts = None
+    attempt_policy_params = None
 
     def inspect_initial_policy(step, make_policy, params):
-        nonlocal initial_evaluation, initial_policy_params, initial_rollouts
+        nonlocal baseline, initial_evaluation, initial_policy_params, initial_rollouts
+        nonlocal attempt_policy_params
         if initial_evaluation is None:
             # The trainer donates device buffers. Retain an independent host copy
             # for the final update measurement, never a reference to donated data.
-            initial_policy_params = jax.tree_util.tree_map(
+            attempt_policy_params = jax.tree_util.tree_map(
                 lambda value: jax.device_get(value).copy(), params[1]
             )
-            initial_evaluation, initial_rollouts = evaluate_policy(
-                eval_env, make_policy, params, config
-            )
-            initial_evaluation["training_step"] = int(step)
-            initial_evaluation["policy_origin"] = (
-                "checkpoint" if checkpoint else "random_initialization"
+            if baseline is None:
+                evaluation, rollouts = evaluate_policy(eval_env, make_policy, params, config)
+                evaluation["training_step"] = int(step)
+                evaluation["policy_origin"] = (
+                    "checkpoint" if checkpoint else "random_initialization"
+                )
+                baseline = {
+                    "evaluation": evaluation,
+                    "rollouts": rollouts,
+                    "policy_params": serialization.to_state_dict(attempt_policy_params),
+                }
+            initial_evaluation = baseline["evaluation"]
+            initial_rollouts = baseline["rollouts"]
+            initial_policy_params = serialization.from_state_dict(
+                attempt_policy_params, baseline["policy_params"]
             )
             write_json(directory / "evaluation_before.json", initial_evaluation)
             if tracker is not None:
-                tracker.evaluation(step, "before", initial_evaluation)
+                tracker.evaluation(
+                    initial_evaluation["training_step"], "before", initial_evaluation
+                )
 
     latest_checkpoint = str(checkpoint.path) if checkpoint is not None else None
 
     def checkpoint_completed_update(state, completed_updates):
         nonlocal latest_checkpoint
         started = time.monotonic()
+        if "baseline" not in metadata:
+            # A retry may write checkpoints into a new directory. Keep its baseline
+            # beside them so the previous attempt's output directory is disposable.
+            metadata["baseline"] = save_baseline(session, baseline)
         path = save_state(
             session,
             state,
@@ -499,15 +536,22 @@ def train(
     final_evaluation, final_rollouts = evaluate_policy(eval_env, make_policy, params, config)
     final_evaluation["training_step"] = actual_steps
     write_json(directory / "evaluation_after.json", final_evaluation)
-    squared_changes = jax.tree_util.tree_map(
-        lambda before, after: ((after - before) ** 2).sum(), initial_policy_params, params[1]
-    )
-    policy_change = math.sqrt(
-        sum(float(value) for value in jax.tree_util.tree_leaves(squared_changes))
-    )
+
+    def parameter_change(before: dict) -> float:
+        squared_changes = jax.tree_util.tree_map(
+            lambda before, after: ((after - before) ** 2).sum(), before, params[1]
+        )
+        return math.sqrt(sum(float(value) for value in jax.tree_util.tree_leaves(squared_changes)))
+
+    policy_change = parameter_change(initial_policy_params)
+    attempt_policy_change = parameter_change(attempt_policy_params)
     if tracker is not None:
         tracker.evaluation(actual_steps, "after", final_evaluation)
-    if not math.isfinite(policy_change) or (actual_steps > starting_step and policy_change == 0):
+    if (
+        not math.isfinite(policy_change)
+        or not math.isfinite(attempt_policy_change)
+        or (actual_steps > starting_step and attempt_policy_change == 0)
+    ):
         raise RuntimeError("Training did not produce a finite, nonzero policy parameter update")
     if actual_steps < config.total_steps:
         raise RuntimeError(
@@ -520,6 +564,8 @@ def train(
         "evaluation_after": final_evaluation,
         "mean_return_change": final_evaluation["mean_return"] - initial_evaluation["mean_return"],
         "policy_parameter_change_l2": policy_change,
+        "attempt_policy_parameter_change_l2": attempt_policy_change,
+        "comparison_start_step": initial_evaluation["training_step"],
         "checkpoints_enabled": config.checkpoints,
         "starting_step": starting_step,
         "steps_this_attempt": actual_steps - starting_step,
@@ -531,7 +577,12 @@ def train(
     }
     if config.video:
         summary["video"] = write_comparison(
-            eval_env, initial_rollouts, final_rollouts, config, directory
+            eval_env,
+            initial_rollouts,
+            final_rollouts,
+            config,
+            directory,
+            baseline_step=initial_evaluation["training_step"],
         )
     return summary
 

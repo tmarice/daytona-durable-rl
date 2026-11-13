@@ -2,13 +2,14 @@
 
 import contextlib
 import dataclasses
+import importlib.util
 import io
 import json
 import tempfile
 import unittest
 from pathlib import Path
 
-from phy_rl.checkpointing import commit_checkpoint, read_checkpoint
+from phy_rl.checkpointing import commit_checkpoint, load_baseline, read_checkpoint, save_baseline
 from phy_rl.daytona_experiment_session import ExperimentSession
 from phy_rl.train import Config, config_values, parse_args
 
@@ -70,6 +71,50 @@ class CheckpointTests(unittest.TestCase):
             self.assertEqual(parse_args(["--resume", str(root), "--gpu"]).backend, "gpu")
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 parse_args(["--resume", str(root), "--seed", "11"])
+
+
+@unittest.skipUnless(importlib.util.find_spec("flax"), "Requires training dependencies")
+class BaselineTests(unittest.TestCase):
+    def test_checkpoint_baseline_preserves_evaluation_and_trajectory_arrays(self) -> None:
+        import numpy as np
+
+        baseline = {
+            "evaluation": {"training_step": 0, "episode_returns": [1.5], "mean_return": 1.5},
+            "rollouts": {"qpos": np.arange(12, dtype=np.float32).reshape(1, 4, 3)},
+            "policy_params": {"weights": np.array([1.0, 2.0], dtype=np.float32)},
+        }
+        with tempfile.TemporaryDirectory() as root:
+            session = ExperimentSession("experiment", "first", root)
+            reference = save_baseline(session, baseline)
+            path = commit_checkpoint(
+                session,
+                b"state",
+                env_steps=64,
+                completed_updates=1,
+                metadata={"baseline": reference},
+            )
+            restored = load_baseline(read_checkpoint(path))
+            self.assertEqual(restored["evaluation"], baseline["evaluation"])
+            np.testing.assert_array_equal(
+                restored["rollouts"]["qpos"], baseline["rollouts"]["qpos"]
+            )
+            np.testing.assert_array_equal(
+                restored["policy_params"]["weights"], baseline["policy_params"]["weights"]
+            )
+            (Path(root) / reference["file"]).write_bytes(b"interrupted or corrupt baseline")
+            with self.assertRaisesRegex(ValueError, "Baseline checksum mismatch"):
+                load_baseline(read_checkpoint(path))
+
+    def test_legacy_checkpoint_has_no_original_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            path = commit_checkpoint(
+                ExperimentSession("experiment", "first", root),
+                b"state",
+                env_steps=64,
+                completed_updates=1,
+                metadata={},
+            )
+            self.assertIsNone(load_baseline(read_checkpoint(path)))
 
 
 if __name__ == "__main__":

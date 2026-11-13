@@ -216,7 +216,7 @@ class ExampleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(constructor.call_args.kwargs["work_dir"], "phy_rl")
         self.assertEqual(constructor.call_args.kwargs["entrypoint"], "train:run")
         self.assertEqual(constructor.call_args.kwargs["resources"]["gpu"], 1)
-        self.assertEqual(constructor.call_args.kwargs["max_concurrent_jobs"], 2)
+        self.assertEqual(constructor.call_args.kwargs["max_concurrent_jobs"], 4)
         self.assertEqual(constructor.call_args.kwargs["env_vars"], {"MUJOCO_GL": "osmesa"})
         self.assertNotIn("secrets", constructor.call_args.kwargs)
         for call, reporter in zip(runner.create_job.call_args_list, self.reporters, strict=True):

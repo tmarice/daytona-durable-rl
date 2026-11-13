@@ -1,7 +1,10 @@
 """Opt-in real MuJoCo/MJX/PPO execution; requires installed dependencies."""
 
+import contextlib
+import io
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -103,7 +106,9 @@ class RealTrainingTests(unittest.TestCase):
             first = run(
                 config, experiment_id="experiment", attempt_id="first", checkpoint_dir=checkpoints
             )
+            original_evaluation = json.loads((first / "evaluation_before.json").read_text())
             saved = read_checkpoint(checkpoints)
+            shutil.rmtree(first)  # Eviction removes the first worker's local output.
             with mock.patch("phy_rl.train.save_state", side_effect=AssertionError("Saved state")):
                 second = run(
                     {**config, "checkpoints": False},
@@ -118,7 +123,14 @@ class RealTrainingTests(unittest.TestCase):
             self.assertEqual(summary["attempt_id"], "second")
             self.assertEqual(summary["resumed_from"], str(saved.path))
             self.assertEqual(summary["latest_checkpoint"], str(saved.path))
-            self.assertEqual(summary["policy_parameter_change_l2"], 0)
+            self.assertEqual(summary["evaluation_before"], original_evaluation)
+            self.assertEqual(summary["comparison_start_step"], 0)
+            self.assertGreater(summary["policy_parameter_change_l2"], 0)
+            self.assertEqual(summary["attempt_policy_parameter_change_l2"], 0)
+            self.assertAlmostEqual(
+                summary["mean_return_change"],
+                summary["evaluation_after"]["mean_return"] - original_evaluation["mean_return"],
+            )
             self.assertFalse((first / "checkpoints").exists())
             self.assertFalse((second / "checkpoints").exists())
 
@@ -151,6 +163,36 @@ class RealTrainingTests(unittest.TestCase):
             self.assertIsNone(summary["latest_checkpoint"])
             self.assertFalse((directory / "checkpoints").exists())
             self.assertFalse((directory / "checkpoint_status.json").exists())
+
+    def test_legacy_checkpoint_comparison_is_labeled_with_its_restored_step(self):
+        with tempfile.TemporaryDirectory() as root:
+            first = run(
+                Config(
+                    total_steps=128,
+                    num_envs=4,
+                    episode_length=16,
+                    unroll_length=8,
+                    batch_size=4,
+                    num_minibatches=2,
+                    updates_per_batch=2,
+                    num_evals=2,
+                    eval_episodes=2,
+                    output=Path(root),
+                )
+            )
+            saved = read_checkpoint(first / "checkpoints")
+            document = json.loads(saved.path.read_text())
+            del document["data"]["metadata"]["baseline"]
+            saved.path.write_text(json.dumps(document))
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                second = run(parse_args(["--resume", str(saved.path)]))
+            summary = json.loads((second / "summary.json").read_text())
+            self.assertIn("checkpoint has no original baseline", output.getvalue())
+            self.assertEqual(summary["comparison_start_step"], 128)
+            self.assertEqual(summary["evaluation_before"]["policy_origin"], "checkpoint")
+            self.assertEqual(summary["evaluation_before"]["training_step"], 128)
+            self.assertEqual(summary["steps_this_attempt"], 0)
 
     def test_wandb_receives_real_training_video_and_resumed_attempt(self):
         import wandb
@@ -202,6 +244,16 @@ class RealTrainingTests(unittest.TestCase):
                 (first / "checkpoints").glob("checkpoint-00000000000000000001-*.json")
             )
             second = run(parse_args(["--resume", str(checkpoint), "--output", root]))
+            self.assertEqual(
+                json.loads((second / "evaluation_before.json").read_text()),
+                json.loads((first / "evaluation_before.json").read_text()),
+            )
+            original_video = json.loads((first / "video.json").read_text())
+            resumed_video = json.loads((second / "video.json").read_text())
+            self.assertEqual(resumed_video["baseline_training_step"], 0)
+            self.assertEqual(
+                resumed_video["episode_returns_before"], original_video["episode_returns_before"]
+            )
             self.assertEqual(len(calls), 2)
             self.assertEqual(calls[0][0]["id"], calls[1][0]["id"])
             self.assertEqual(calls[1][0]["resume"], "allow")
@@ -402,7 +454,9 @@ with patch.object(Checkpoint, 'restore', audited_restore):
             self.assertEqual(summary["starting_step"], 192)
             self.assertEqual(summary["actual_steps"], 512)
             self.assertEqual(summary["steps_this_attempt"], 320)
-            self.assertEqual(summary["evaluation_before"]["policy_origin"], "checkpoint")
+            original_evaluation = json.loads((first / "evaluation_before.json").read_text())
+            self.assertEqual(summary["evaluation_before"], original_evaluation)
+            self.assertEqual(summary["comparison_start_step"], 0)
             rows = [json.loads(row) for row in (second / "metrics.jsonl").read_text().splitlines()]
             self.assertEqual(rows[0]["step"], 192)
             self.assertEqual([row["step"] for row in rows], sorted(row["step"] for row in rows))
@@ -417,6 +471,9 @@ with patch.object(Checkpoint, 'restore', audited_restore):
             adam = final_state["learner"]["optimizer_state"]["1"]["0"]
             self.assertEqual(int(adam["count"]), 8 * 2 * 2)
 
+            # A later retry must not depend on the first attempt's files.
+            shutil.rmtree(first)
+
             completed = execute(
                 "from phy_rl.train import main; raise SystemExit(main())",
                 ["--resume", str(final.path)],
@@ -427,7 +484,9 @@ with patch.object(Checkpoint, 'restore', audited_restore):
             ]
             summary = json.loads((third / "summary.json").read_text())
             self.assertEqual(summary["steps_this_attempt"], 0)
-            self.assertEqual(summary["policy_parameter_change_l2"], 0)
+            self.assertEqual(summary["evaluation_before"], original_evaluation)
+            self.assertGreater(summary["policy_parameter_change_l2"], 0)
+            self.assertEqual(summary["attempt_policy_parameter_change_l2"], 0)
             self.assertFalse((third / "checkpoints").exists())
 
 

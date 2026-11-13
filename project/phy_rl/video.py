@@ -84,7 +84,9 @@ def check_rendering(env, task: str) -> None:
         renderer.render()
 
 
-def write_comparison(env, before: dict, after: dict, config, directory: Path) -> dict:
+def write_comparison(
+    env, before: dict, after: dict, config, directory: Path, *, baseline_step: int = 0
+) -> dict:
     """Stream native before/after frames with labels into an H.264 MP4."""
     import matplotlib
 
@@ -117,7 +119,10 @@ def write_comparison(env, before: dict, after: dict, config, directory: Path) ->
         fontsize=10,
     )
     images = []
-    titles = ("RESTORED POLICY" if config.resume else "INITIAL POLICY", "ATTEMPT END POLICY")
+    titles = (
+        "INITIAL POLICY" if baseline_step == 0 else f"BASELINE AT STEP {baseline_step:,}",
+        "FINAL POLICY",
+    )
     for axis in axes:
         images.append(axis.imshow(np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)))
         axis.set_axis_off()
@@ -160,6 +165,7 @@ def write_comparison(env, before: dict, after: dict, config, directory: Path) ->
 
     metadata = {
         "path": path.name,
+        "baseline_training_step": baseline_step,
         "renderer": "mujoco_native",
         "camera": camera if isinstance(camera, str) else "fixed_panda",
         "frame_width": WIDTH,

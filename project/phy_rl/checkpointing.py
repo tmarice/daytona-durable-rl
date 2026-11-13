@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -98,6 +99,32 @@ def read_checkpoint(path: Path) -> Checkpoint:
     """Inspect a new-format checkpoint file or directory, including CLI configuration."""
     path, document = read_checkpoint_document(path)
     return checkpoint_from_data(path, document["data"])
+
+
+def save_baseline(session: ExperimentSession, baseline: dict) -> dict:
+    """Write the comparison data once, before a checkpoint references it."""
+    from flax import serialization
+
+    payload = serialization.msgpack_serialize(baseline)
+    session.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    path = session.checkpoint_dir / f"baseline-{uuid.uuid4().hex}.msgpack"
+    with path.open("xb") as stream:
+        stream.write(payload)
+    return {"file": path.name, "sha256": hashlib.sha256(payload).hexdigest()}
+
+
+def load_baseline(checkpoint: Checkpoint) -> dict | None:
+    """Read the original comparison data; older checkpoints have no baseline."""
+    from flax import serialization
+
+    reference = checkpoint.manifest["metadata"].get("baseline")
+    if reference is None:
+        return None
+    path = checkpoint.path.parent / reference["file"]
+    payload = path.read_bytes()
+    if hashlib.sha256(payload).hexdigest() != reference["sha256"]:
+        raise ValueError(f"Baseline checksum mismatch at {path}")
+    return serialization.msgpack_restore(payload)
 
 
 def save_state(

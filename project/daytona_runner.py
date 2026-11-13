@@ -27,10 +27,12 @@ from daytona.v0 import (
     VolumeMount,
 )
 from daytona.v0.common.errors import (
+    DaytonaConflictError,
     DaytonaConnectionError,
     DaytonaError,
     DaytonaNotFoundError,
     DaytonaSpotEvictedError,
+    DaytonaTimeoutError,
 )
 from daytona.v0.common.process import (
     ExecuteResponse,
@@ -82,6 +84,14 @@ class DaytonaAPI:
                         TimeoutError,
                     ),
                 ) or status in {408, 429, 500, 502, 503, 504}
+                if name == "sandbox.create" and isinstance(error, DaytonaTimeoutError):
+                    transient = True
+                if (
+                    name == "sandbox.delete"
+                    and isinstance(error, DaytonaConflictError)
+                    and "sandbox state change in progress" in str(error).lower()
+                ):
+                    transient = True
                 if (
                     isinstance(error, DaytonaSpotEvictedError)
                     or not transient
@@ -105,10 +115,32 @@ class DaytonaAPI:
         await self._client.close()
 
     async def create_sandbox(self, params: CreateSandboxFromSnapshotParams) -> AsyncSandbox:
+        timed_out_sandbox = None
+
         async def create_once() -> AsyncSandbox:
+            nonlocal timed_out_sandbox
+            if timed_out_sandbox is not None:
+                try:
+                    sandbox = await self._client.v0.get(timed_out_sandbox)
+                except DaytonaNotFoundError:
+                    pass  # No sandbox to reuse; retry creation with the same name.
+                else:
+                    await sandbox.wait_for_sandbox_start(timeout=60)
+                    return sandbox
+
             creation = asyncio.create_task(self._client.v0.create(params))
             try:
                 return await asyncio.shield(creation)
+            except DaytonaTimeoutError as error:
+                timed_out_sandbox = error.sandbox_id or params.name
+                raise
+            except DaytonaConflictError:
+                if timed_out_sandbox is None:
+                    raise
+                # The original create may have completed after our lookup returned 404.
+                sandbox = await self._client.v0.get(params.name)
+                await sandbox.wait_for_sandbox_start(timeout=60)
+                return sandbox
             except asyncio.CancelledError:
                 # Let this one request settle before DaytonaJob's finally block
                 # looks up the sandbox by its existing name and deletes it.
@@ -283,13 +315,17 @@ class DaytonaJob:
         try:
             sandbox = await self._create_sandbox(sandbox_name)
             logger.info("Job %s | sandbox allocated; staging source", self.id[:8])
-            await self._upload_source_package(sandbox)
-            await self._api.create_session(sandbox, self.id)
-            response = await self._api.execute_session_command(
-                sandbox,
-                self.id,
-                SessionExecuteRequest(command=self._build_command(), run_async=True),
-            )
+            try:
+                await self._upload_source_package(sandbox)
+                await self._api.create_session(sandbox, self.id)
+                response = await self._api.execute_session_command(
+                    sandbox,
+                    self.id,
+                    SessionExecuteRequest(command=self._build_command(), run_async=True),
+                )
+            except DaytonaError:
+                await self._raise_if_preempted(sandbox)
+                raise
             self.status = DaytonaJobStatus.RUNNING
             logger.info("Job %s | worker started", self.id[:8])
             result = await self._wait_for_command(sandbox, response.cmd_id)
